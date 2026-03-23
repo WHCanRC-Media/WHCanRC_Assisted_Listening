@@ -68,7 +68,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Start the audio-to-WebRTC-track writer
     let audio_rx = audio_tx.subscribe();
-    tokio::spawn(audio_to_track_writer(audio_track, audio_rx));
+    tokio::spawn(audio_to_track_writer(
+        audio_track,
+        audio_rx,
+        config.opus_frame_ms,
+    ));
 
     // Build application state and HTTP server
     let app_state = Arc::new(AppState {

@@ -9,6 +9,9 @@ pub struct Config {
     pub log_level: String,
     pub audio_sample_rate: u32,
     pub audio_channels: u16,
+    /// Opus frame duration in milliseconds. Valid values: 5, 10, 20, 40, 60.
+    /// Lower values reduce latency but increase overhead.
+    pub opus_frame_ms: u64,
 }
 
 impl Default for Config {
@@ -18,6 +21,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             audio_sample_rate: 48000,
             audio_channels: 1,
+            opus_frame_ms: 10,
         }
     }
 }
@@ -46,6 +50,9 @@ impl Config {
         }
         if let Ok(val) = std::env::var("WHCANRC_AUDIO_CHANNELS") {
             config.audio_channels = val.parse()?;
+        }
+        if let Ok(val) = std::env::var("WHCANRC_OPUS_FRAME_MS") {
+            config.opus_frame_ms = val.parse()?;
         }
 
         Ok(config)

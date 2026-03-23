@@ -95,7 +95,7 @@ impl AudioSource for ToneAudioSource {
         channels: u16,
     ) -> anyhow::Result<()> {
         info!("Test tone mode: generating 440Hz sine wave");
-        let frame_count = (sample_rate / 50) as usize; // 20ms chunks
+        let frame_count = (sample_rate / 100) as usize; // 10ms chunks
         let mut sample_offset: usize = 0;
 
         loop {
@@ -116,8 +116,8 @@ impl AudioSource for ToneAudioSource {
                 break;
             }
 
-            // Sleep for ~20ms to match real-time playback rate
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Sleep for ~10ms to match real-time playback rate
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(())
     }

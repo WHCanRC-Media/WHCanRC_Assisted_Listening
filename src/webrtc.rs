@@ -165,21 +165,28 @@ impl PeerManager {
     }
 }
 
-/// Opus frame size: 960 samples at 48kHz = 20ms, which is the standard Opus frame duration.
-const OPUS_FRAME_SIZE: usize = 960;
-const OPUS_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// Encode raw PCM f32 samples to Opus and write to the WebRTC track.
 /// This task runs continuously, reading from the audio broadcast channel.
+///
+/// `opus_frame_ms` controls the Opus frame duration (valid: 5, 10, 20, 40, 60).
+/// Lower values reduce latency but increase per-packet overhead.
 pub async fn audio_to_track_writer(
     track: Arc<TrackLocalStaticSample>,
     mut audio_rx: broadcast::Receiver<AudioChunk>,
+    opus_frame_ms: u64,
 ) {
     use audiopus::coder::Encoder;
     use audiopus::{Application, Channels, SampleRate};
     use webrtc::media::Sample;
 
-    info!("Audio-to-track writer started");
+    // Calculate frame size in samples: e.g. 10ms at 48kHz = 480 samples
+    let opus_frame_size = (48000 * opus_frame_ms as usize) / 1000;
+    let opus_frame_duration = std::time::Duration::from_millis(opus_frame_ms);
+
+    info!(
+        "Audio-to-track writer started ({}ms Opus frames, {} samples/frame)",
+        opus_frame_ms, opus_frame_size
+    );
 
     let encoder = match Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip) {
         Ok(enc) => enc,
@@ -190,7 +197,7 @@ pub async fn audio_to_track_writer(
     };
 
     // Buffer to accumulate samples into complete Opus frames
-    let mut pcm_buffer: Vec<i16> = Vec::with_capacity(OPUS_FRAME_SIZE * 2);
+    let mut pcm_buffer: Vec<i16> = Vec::with_capacity(opus_frame_size * 2);
     let mut opus_output = vec![0u8; 4000]; // max Opus packet size
 
     loop {
@@ -207,14 +214,14 @@ pub async fn audio_to_track_writer(
                 }
 
                 // Encode complete 960-sample frames
-                while pcm_buffer.len() >= OPUS_FRAME_SIZE {
-                    let frame: Vec<i16> = pcm_buffer.drain(..OPUS_FRAME_SIZE).collect();
+                while pcm_buffer.len() >= opus_frame_size {
+                    let frame: Vec<i16> = pcm_buffer.drain(..opus_frame_size).collect();
 
                     match encoder.encode(&frame, &mut opus_output) {
                         Ok(len) => {
                             let sample = Sample {
                                 data: opus_output[..len].to_vec().into(),
-                                duration: OPUS_FRAME_DURATION,
+                                duration: opus_frame_duration,
                                 ..Default::default()
                             };
 

@@ -106,7 +106,7 @@ async fn test_end_to_end_audio_delivery() {
 
     let audio_tx = start_audio_capture(ToneAudioSource, 48000, 1);
     let audio_rx = audio_tx.subscribe();
-    tokio::spawn(audio_to_track_writer(audio_track, audio_rx));
+    tokio::spawn(audio_to_track_writer(audio_track, audio_rx, 10));
 
     let state = Arc::new(AppState {
         peer_manager,
