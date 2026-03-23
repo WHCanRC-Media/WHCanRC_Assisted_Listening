@@ -84,7 +84,46 @@ impl AudioSource for CpalAudioSource {
     }
 }
 
-/// Mock audio source for testing — generates silence or a known pattern.
+/// Audio source that generates a continuous 440Hz sine wave test tone.
+pub struct ToneAudioSource;
+
+impl AudioSource for ToneAudioSource {
+    fn start_capture(
+        &self,
+        tx: broadcast::Sender<AudioChunk>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> anyhow::Result<()> {
+        info!("Test tone mode: generating 440Hz sine wave");
+        let frame_count = (sample_rate / 50) as usize; // 20ms chunks
+        let mut sample_offset: usize = 0;
+
+        loop {
+            let samples: Vec<f32> = (0..frame_count)
+                .map(|s| {
+                    let t = (sample_offset + s) as f32 / sample_rate as f32;
+                    (t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.5
+                })
+                .collect();
+            sample_offset += frame_count;
+
+            let chunk = AudioChunk {
+                samples,
+                sample_rate,
+                channels,
+            };
+            if tx.send(chunk).is_err() {
+                break;
+            }
+
+            // Sleep for ~20ms to match real-time playback rate
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(())
+    }
+}
+
+/// Mock audio source for testing — generates a finite number of chunks.
 #[cfg(test)]
 pub struct MockAudioSource {
     pub chunk_count: usize,

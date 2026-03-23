@@ -165,15 +165,33 @@ impl PeerManager {
     }
 }
 
+/// Opus frame size: 960 samples at 48kHz = 20ms, which is the standard Opus frame duration.
+const OPUS_FRAME_SIZE: usize = 960;
+const OPUS_FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Encode raw PCM f32 samples to Opus and write to the WebRTC track.
 /// This task runs continuously, reading from the audio broadcast channel.
 pub async fn audio_to_track_writer(
     track: Arc<TrackLocalStaticSample>,
     mut audio_rx: broadcast::Receiver<AudioChunk>,
 ) {
+    use audiopus::coder::Encoder;
+    use audiopus::{Application, Channels, SampleRate};
     use webrtc::media::Sample;
 
     info!("Audio-to-track writer started");
+
+    let encoder = match Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip) {
+        Ok(enc) => enc,
+        Err(e) => {
+            error!("Failed to create Opus encoder: {}", e);
+            return;
+        }
+    };
+
+    // Buffer to accumulate samples into complete Opus frames
+    let mut pcm_buffer: Vec<i16> = Vec::with_capacity(OPUS_FRAME_SIZE * 2);
+    let mut opus_output = vec![0u8; 4000]; // max Opus packet size
 
     loop {
         match audio_rx.recv().await {
@@ -182,28 +200,32 @@ pub async fn audio_to_track_writer(
                     continue;
                 }
 
-                // Convert f32 samples to i16 PCM bytes (little-endian)
-                let pcm_bytes: Vec<u8> = chunk
-                    .samples
-                    .iter()
-                    .flat_map(|&s| {
-                        let clamped = s.clamp(-1.0, 1.0);
-                        let i16_val = (clamped * i16::MAX as f32) as i16;
-                        i16_val.to_le_bytes()
-                    })
-                    .collect();
+                // Convert f32 samples to i16 and accumulate
+                for &s in &chunk.samples {
+                    let clamped = s.clamp(-1.0, 1.0);
+                    pcm_buffer.push((clamped * i16::MAX as f32) as i16);
+                }
 
-                // Calculate duration of this chunk
-                let duration_ms = (chunk.samples.len() as u64 * 1000) / chunk.sample_rate as u64;
+                // Encode complete 960-sample frames
+                while pcm_buffer.len() >= OPUS_FRAME_SIZE {
+                    let frame: Vec<i16> = pcm_buffer.drain(..OPUS_FRAME_SIZE).collect();
 
-                let sample = Sample {
-                    data: pcm_bytes.into(),
-                    duration: std::time::Duration::from_millis(duration_ms),
-                    ..Default::default()
-                };
+                    match encoder.encode(&frame, &mut opus_output) {
+                        Ok(len) => {
+                            let sample = Sample {
+                                data: opus_output[..len].to_vec().into(),
+                                duration: OPUS_FRAME_DURATION,
+                                ..Default::default()
+                            };
 
-                if let Err(e) = track.write_sample(&sample).await {
-                    warn!("Failed to write audio sample to track: {}", e);
+                            if let Err(e) = track.write_sample(&sample).await {
+                                warn!("Failed to write audio sample to track: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Opus encode error: {}", e);
+                        }
+                    }
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
