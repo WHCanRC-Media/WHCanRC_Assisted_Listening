@@ -1,0 +1,4 @@
+port = 8080
+log_level = "info"          # trace, debug, info, warn, error
+audio_sample_rate = 48000
+audio_channels = 1          # mono is sufficient for speech

@@ -1,0 +1,46 @@
+[package]
+name = "whcanrc-assisted-listening"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency WebRTC audio streaming server for assisted listening"
+license = "MIT"
+
+[[bin]]
+name = "whcanrc-assisted-listening"
+path = "src/main.rs"
+
+[dependencies]
+# Audio capture
+cpal = "0.15"
+
+# WebRTC
+webrtc = "0.11"
+
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization & config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+anyhow = "1"
+ringbuf = "0.4"
+
+# Windows service support (Windows only)
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }

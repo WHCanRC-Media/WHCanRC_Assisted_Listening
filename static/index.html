@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>WHCanRC Assisted Listening</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  h1 {
+    font-size: 1.4rem;
+    margin-bottom: 8px;
+    text-align: center;
+  }
+  .subtitle {
+    font-size: 0.85rem;
+    color: #888;
+    margin-bottom: 32px;
+    text-align: center;
+  }
+  #listen-btn {
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    border: 4px solid #4a90d9;
+    background: rgba(74, 144, 217, 0.15);
+    color: #4a90d9;
+    font-size: 1.3rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    outline: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #listen-btn:hover { background: rgba(74, 144, 217, 0.3); }
+  #listen-btn:active { transform: scale(0.95); }
+  #listen-btn.live {
+    border-color: #4caf50;
+    background: rgba(76, 175, 80, 0.15);
+    color: #4caf50;
+  }
+  #listen-btn.connecting {
+    border-color: #ff9800;
+    background: rgba(255, 152, 0, 0.15);
+    color: #ff9800;
+    animation: pulse 1.5s infinite;
+  }
+  #listen-btn.error {
+    border-color: #f44336;
+    background: rgba(244, 67, 54, 0.15);
+    color: #f44336;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+  #status {
+    margin-top: 24px;
+    font-size: 0.95rem;
+    color: #888;
+    text-align: center;
+  }
+  .level-container {
+    margin-top: 24px;
+    width: 200px;
+    height: 8px;
+    background: #333;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  #level-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #4caf50, #ff9800, #f44336);
+    border-radius: 4px;
+    transition: width 0.1s ease;
+  }
+  .level-label {
+    margin-top: 6px;
+    font-size: 0.75rem;
+    color: #666;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>WHCanRC Assisted Listening</h1>
+<p class="subtitle">Tap to start listening</p>
+
+<button id="listen-btn" onclick="toggleListen()">Listen</button>
+
+<p id="status">Ready</p>
+
+<div class="level-container">
+  <div id="level-bar"></div>
+</div>
+<p class="level-label">Audio Level</p>
+
+<script>
+let pc = null;
+let audioCtx = null;
+let analyser = null;
+let animFrame = null;
+let isListening = false;
+let reconnectTimeout = null;
+
+const btn = document.getElementById('listen-btn');
+const statusEl = document.getElementById('status');
+const levelBar = document.getElementById('level-bar');
+
+function setStatus(text, state) {
+  statusEl.textContent = text;
+  btn.className = state || '';
+}
+
+function toggleListen() {
+  if (isListening) {
+    disconnect();
+  } else {
+    connect();
+  }
+}
+
+async function connect() {
+  if (pc) disconnect();
+  isListening = true;
+  btn.textContent = 'Stop';
+  setStatus('Connecting...', 'connecting');
+
+  try {
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    pc.ontrack = (event) => {
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      // Play audio
+      const audio = new Audio();
+      audio.srcObject = stream;
+      audio.play().catch(() => {});
+
+      // Set up level meter
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      updateLevel();
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const state = pc.iceConnectionState;
+      if (state === 'connected' || state === 'completed') {
+        setStatus('Live', 'live');
+      } else if (state === 'disconnected') {
+        setStatus('Disconnected — reconnecting...', 'connecting');
+        scheduleReconnect();
+      } else if (state === 'failed' || state === 'closed') {
+        setStatus('Connection lost — reconnecting...', 'error');
+        scheduleReconnect();
+      }
+    };
+
+    // We only receive audio, but we need to create an offer
+    // Add a transceiver in recvonly mode
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Send offer to server
+    const response = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sdp: pc.localDescription.sdp,
+        type: pc.localDescription.type
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('Server returned ' + response.status);
+    }
+
+    const answer = await response.json();
+    await pc.setRemoteDescription(new RTCSessionDescription({
+      sdp: answer.sdp,
+      type: answer.type
+    }));
+
+  } catch (e) {
+    console.error('Connection error:', e);
+    setStatus('Error: ' + e.message, 'error');
+    scheduleReconnect();
+  }
+}
+
+function disconnect() {
+  isListening = false;
+  btn.textContent = 'Listen';
+  clearTimeout(reconnectTimeout);
+  reconnectTimeout = null;
+
+  if (animFrame) {
+    cancelAnimationFrame(animFrame);
+    animFrame = null;
+  }
+  if (audioCtx) {
+    audioCtx.close().catch(() => {});
+    audioCtx = null;
+    analyser = null;
+  }
+  if (pc) {
+    pc.close();
+    pc = null;
+  }
+  levelBar.style.width = '0%';
+  setStatus('Ready', '');
+}
+
+function scheduleReconnect() {
+  if (!isListening || reconnectTimeout) return;
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    if (isListening) {
+      if (pc) { pc.close(); pc = null; }
+      connect();
+    }
+  }, 3000);
+}
+
+function updateLevel() {
+  if (!analyser) return;
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) sum += data[i];
+  const avg = sum / data.length;
+  const pct = Math.min(100, (avg / 128) * 100);
+  levelBar.style.width = pct + '%';
+  animFrame = requestAnimationFrame(updateLevel);
+}
+</script>
+</body>
+</html>
