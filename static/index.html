@@ -91,6 +91,22 @@
     color: #666;
     text-align: center;
   }
+  .nav {
+    margin-top: 32px;
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .nav a {
+    font-size: 0.8rem;
+    color: #4a90d9;
+    text-decoration: none;
+    padding: 6px 14px;
+    border: 1px solid #333;
+    border-radius: 6px;
+  }
+  .nav a:hover { border-color: #4a90d9; }
 </style>
 </head>
 <body>
@@ -250,5 +266,11 @@ function updateLevel() {
   animFrame = requestAnimationFrame(updateLevel);
 }
 </script>
+
+<div class="nav">
+  <a href="/low_latency">Low Latency</a>
+  <a href="/latency_test">Latency Test</a>
+</div>
+
 </body>
 </html>

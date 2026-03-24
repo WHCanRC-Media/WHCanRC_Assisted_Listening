@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// A chunk of audio samples (mono f32, at the configured sample rate).
 /// Sent via broadcast channel to all WebRTC peer writers.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct AudioChunk {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
@@ -45,10 +45,40 @@ impl AudioSource for CpalAudioSource {
             device.name().unwrap_or_else(|_| "Unknown".to_string())
         );
 
+        // Try small fixed buffer sizes for low latency, fall back to default
+        let buffer_size = [256u32, 512, 1024]
+            .iter()
+            .find(|&&size| {
+                let test_config = cpal::StreamConfig {
+                    channels,
+                    sample_rate: cpal::SampleRate(sample_rate),
+                    buffer_size: cpal::BufferSize::Fixed(size),
+                };
+                device.supported_input_configs().map_or(false, |_| {
+                    // Try building a dummy stream to check if the buffer size works
+                    device
+                        .build_input_stream(
+                            &test_config,
+                            |_data: &[f32], _: &cpal::InputCallbackInfo| {},
+                            |_| {},
+                            None,
+                        )
+                        .is_ok()
+                })
+            })
+            .map(|&size| {
+                info!("Using fixed audio buffer size: {} samples ({:.1}ms)", size, size as f32 / sample_rate as f32 * 1000.0);
+                cpal::BufferSize::Fixed(size)
+            })
+            .unwrap_or_else(|| {
+                info!("No small fixed buffer size supported, using device default");
+                cpal::BufferSize::Default
+            });
+
         let desired_config = cpal::StreamConfig {
             channels,
             sample_rate: cpal::SampleRate(sample_rate),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size,
         };
 
         let tx_err = tx.clone();

@@ -38,8 +38,17 @@ clap = { version = "4", features = ["derive"] }
 # Audio encoding
 audiopus = "0.3.0-rc.0"
 
+# TLS (self-signed for LAN getUserMedia support)
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
+
+# QR code
+qrcode = "0.14"
+
 # Utilities
 anyhow = "1"
+bytes = "1"
 ringbuf = "0.4"
 
 # Windows service support (Windows only)
@@ -49,4 +58,5 @@ windows-service = "0.7"
 [dev-dependencies]
 tokio-test = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
+rustls = { version = "0.23", features = ["ring"] }
 tower = { version = "0.5", features = ["util"] }

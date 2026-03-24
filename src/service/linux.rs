@@ -1,6 +1,7 @@
 use tracing::info;
 
 /// Generate a systemd unit file for the service.
+#[allow(dead_code)]
 pub fn generate_systemd_unit() -> String {
     r#"[Unit]
 Description=WHCanRC Assisted Listening Server
@@ -24,6 +25,7 @@ WantedBy=multi-user.target
 }
 
 /// Install the systemd unit file to the system.
+#[allow(dead_code)]
 pub fn install_systemd_unit() -> anyhow::Result<()> {
     let unit = generate_systemd_unit();
     let path = "/etc/systemd/system/whcanrc-assisted-listening.service";

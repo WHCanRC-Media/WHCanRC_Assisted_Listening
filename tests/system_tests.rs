@@ -100,13 +100,16 @@ async fn test_end_to_end_audio_delivery() {
     use webrtc::peer_connection::configuration::RTCConfiguration;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
+    // Ensure rustls crypto provider is installed (needed when axum-server pulls in rustls)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // 1. Start the full server pipeline with a test tone
     let peer_manager = PeerManager::new().unwrap();
     let audio_track = Arc::clone(peer_manager.audio_track());
 
     let audio_tx = start_audio_capture(ToneAudioSource, 48000, 1);
     let audio_rx = audio_tx.subscribe();
-    tokio::spawn(audio_to_track_writer(audio_track, audio_rx, 10));
+    tokio::spawn(audio_to_track_writer(audio_track, audio_rx, 10, None));
 
     let state = Arc::new(AppState {
         peer_manager,

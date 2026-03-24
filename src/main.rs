@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod latency_test;
 mod server;
 mod service;
 mod webrtc;
@@ -7,6 +8,7 @@ mod webrtc;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use tokio::sync::Mutex;
 use tracing::info;
@@ -14,7 +16,7 @@ use tracing::info;
 use audio::{start_audio_capture, CpalAudioSource, ToneAudioSource};
 use config::Config;
 use server::{build_router, AppState};
-use webrtc::{audio_to_track_writer, PeerManager};
+use webrtc::{audio_to_datachannel_writer, audio_to_track_writer, PeerManager};
 
 /// WHCanRC Assisted Listening — low-latency WebRTC audio streaming server.
 ///
@@ -26,10 +28,19 @@ struct Cli {
     /// Stream a 440Hz test tone instead of capturing from the audio input device
     #[arg(long)]
     test_tone: bool,
+
+    /// Enable round-trip latency measurement: injects a 2ms chirp every second
+    /// and listens for it to return through the mic
+    #[arg(long)]
+    latency_test: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let cli = Cli::parse();
 
     // Load configuration
@@ -66,12 +77,41 @@ async fn main() -> anyhow::Result<()> {
         )
     };
 
-    // Start the audio-to-WebRTC-track writer
+    // Set up latency test if requested
+    let chirp_state = if cli.latency_test {
+        let state = std::sync::Arc::new(latency_test::ChirpState::new(config.audio_sample_rate));
+        info!("Latency test enabled — injecting chirp every second");
+
+        // Spawn the 1-second chirp timer
+        let timer_state = Arc::clone(&state);
+        tokio::spawn(latency_test::chirp_timer(timer_state));
+
+        // Spawn the chirp detector on raw mic audio
+        let detector_state = Arc::clone(&state);
+        let detector_rx = audio_tx.subscribe();
+        tokio::spawn(latency_test::chirp_detector(detector_state, detector_rx));
+
+        Some(state)
+    } else {
+        None
+    };
+
+    // Start the audio-to-WebRTC-track writer (normal path)
     let audio_rx = audio_tx.subscribe();
     tokio::spawn(audio_to_track_writer(
         audio_track,
         audio_rx,
         config.opus_frame_ms,
+        chirp_state.clone(),
+    ));
+
+    // Start the audio-to-DataChannel writer (low-latency path, raw PCM)
+    let dc_audio_rx = audio_tx.subscribe();
+    let data_channels = Arc::clone(peer_manager.data_channels());
+    tokio::spawn(audio_to_datachannel_writer(
+        data_channels,
+        dc_audio_rx,
+        chirp_state,
     ));
 
     // Build application state and HTTP server
@@ -83,10 +123,41 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    info!("Listening on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Generate self-signed TLS cert for HTTPS (needed for getUserMedia on LAN)
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "0.0.0.0".to_string()])?;
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+
+    let tls_config = RustlsConfig::from_pem(cert_pem.into(), key_pem.into()).await?;
+
+    // Detect LAN IP for the QR code
+    let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "localhost".to_string());
+
+    let url = format!("https://{}:{}", lan_ip, config.port);
+    info!("Listening on {}", url);
+    info!("Note: self-signed cert — accept the browser warning to connect");
+
+    // Print QR code to terminal
+    if let Ok(qr) = qrcode::QrCode::new(url.as_bytes()) {
+        let rendered = qr
+            .render::<char>()
+            .quiet_zone(true)
+            .module_dimensions(2, 1)
+            .build();
+        eprintln!("\n{}\n  {}\n", rendered, url);
+    }
+
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
+        .await?;
 
     Ok(())
 }

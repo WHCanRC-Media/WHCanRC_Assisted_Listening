@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>WHCanRC — Low Latency</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 8px; text-align: center; }
+  .subtitle { font-size: 0.85rem; color: #888; margin-bottom: 32px; text-align: center; }
+  #listen-btn {
+    width: 140px; height: 140px; border-radius: 50%;
+    border: 4px solid #4a90d9; background: rgba(74,144,217,0.15);
+    color: #4a90d9; font-size: 1.3rem; font-weight: 600;
+    cursor: pointer; transition: all 0.3s; outline: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #listen-btn:hover { background: rgba(74,144,217,0.3); }
+  #listen-btn:active { transform: scale(0.95); }
+  #listen-btn.live { border-color: #4caf50; background: rgba(76,175,80,0.15); color: #4caf50; }
+  #listen-btn.connecting { border-color: #ff9800; background: rgba(255,152,0,0.15); color: #ff9800; animation: pulse 1.5s infinite; }
+  #listen-btn.error { border-color: #f44336; background: rgba(244,67,54,0.15); color: #f44336; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+  #status { margin-top: 24px; font-size: 0.95rem; color: #888; text-align: center; }
+  .level-container { margin-top: 24px; width: 200px; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
+  #level-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #4caf50, #ff9800, #f44336); border-radius: 4px; transition: width 0.05s; }
+  .level-label { margin-top: 6px; font-size: 0.75rem; color: #666; text-align: center; }
+  .stats { margin-top: 16px; font-size: 0.75rem; color: #555; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>WHCanRC Low Latency</h1>
+<p class="subtitle">DataChannel + raw PCM — zero codec latency</p>
+
+<button id="listen-btn" onclick="toggleListen()">Listen</button>
+<p id="status">Ready</p>
+
+<div class="level-container"><div id="level-bar"></div></div>
+<p class="level-label">Audio Level</p>
+<p class="stats" id="stats"></p>
+
+<script>
+let pc = null;
+let audioCtx = null;
+let workletNode = null;
+let isListening = false;
+let packetsReceived = 0;
+let underruns = 0;
+let lastDrops = 0;
+let lastDupes = 0;
+let lastAvgMs = 0;
+let statsInterval = null;
+
+// Jitter measurement: track inter-arrival times of DataChannel messages
+let lastArrivalMs = 0;
+let jitterDeltas = [];  // rolling window of inter-arrival times (ms)
+
+const btn = document.getElementById('listen-btn');
+const statusEl = document.getElementById('status');
+const levelBar = document.getElementById('level-bar');
+const statsEl = document.getElementById('stats');
+
+// AudioWorklet processor code — runs on audio thread with a small ring buffer
+const workletCode = `
+class PCMPlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    // 200ms ring buffer at 48kHz — generous headroom for bursty delivery
+    this.buffer = new Float32Array(9600);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.count = 0;
+    this.underruns = 0;
+    this.drops = 0;
+    this.dupes = 0;
+
+    // Clock drift compensation: target 50ms (2400 samples).
+    // Packets arrive in bursts (~30ms chunks from ALSA), so we need
+    // enough cushion to absorb a full burst gap without underrunning.
+    // Dead zone: ±5ms (±240 samples) — only correct outside this band
+    // to avoid fighting normal jitter.
+    // Correction rate: 1 sample every 8 blocks (~0.1% speed change).
+    this.target = 2400;
+    this.deadZone = 240;
+    this.correctionInterval = 8;
+    this.avgCount = 0;        // exponential moving average of buffer level
+    this.avgAlpha = 0.002;    // smoothing factor (~1.5 sec time constant at 375 calls/sec)
+    this.initialized = false; // wait for buffer to fill before starting playback
+    this.processCount = 0;
+
+    this.port.onmessage = (e) => {
+      const samples = e.data;
+      for (let i = 0; i < samples.length; i++) {
+        if (this.count < this.buffer.length) {
+          this.buffer[this.writePos] = samples[i];
+          this.writePos = (this.writePos + 1) % this.buffer.length;
+          this.count++;
+        } else {
+          // Ring buffer full — drop oldest
+          this.buffer[this.writePos] = samples[i];
+          this.writePos = (this.writePos + 1) % this.buffer.length;
+          this.readPos = (this.readPos + 1) % this.buffer.length;
+        }
+      }
+    };
+  }
+
+  process(inputs, outputs) {
+    const output = outputs[0][0];
+    if (!output) return true;
+    this.processCount++;
+
+    // Wait until buffer reaches target before starting playback (priming)
+    if (!this.initialized) {
+      if (this.count >= this.target) {
+        this.initialized = true;
+        this.avgCount = this.count;
+      } else {
+        output.fill(0);
+        return true;
+      }
+    }
+
+    // Update exponential moving average of buffer level
+    this.avgCount = this.avgCount * (1 - this.avgAlpha) + this.count * this.avgAlpha;
+
+    // Clock drift compensation: only correct when average drifts outside
+    // the dead zone, and only every Nth block to keep corrections gentle.
+    let drift = 0;
+    if (this.processCount % this.correctionInterval === 0) {
+      if (this.avgCount > this.target + this.deadZone) {
+        drift = 1;  // buffer growing — consume one extra sample
+      } else if (this.avgCount < this.target - this.deadZone) {
+        drift = -1; // buffer shrinking — duplicate one sample
+      }
+    }
+
+    let outputIdx = 0;
+    while (outputIdx < output.length) {
+      if (this.count > 0) {
+        output[outputIdx] = this.buffer[this.readPos];
+        this.readPos = (this.readPos + 1) % this.buffer.length;
+        this.count--;
+        outputIdx++;
+
+        // Drop: skip one extra sample mid-block
+        if (drift === 1 && outputIdx === 64 && this.count > 0) {
+          this.readPos = (this.readPos + 1) % this.buffer.length;
+          this.count--;
+          this.drops++;
+          drift = 0;
+        }
+      } else {
+        output[outputIdx] = 0;
+        this.underruns++;
+        outputIdx++;
+      }
+    }
+
+    // Dupe: repeat one sample by rewinding read pointer
+    if (drift === -1 && this.count > 0) {
+      this.readPos = (this.readPos - 1 + this.buffer.length) % this.buffer.length;
+      this.count++;
+      this.dupes++;
+    }
+
+    // Report stats every ~50ms
+    if (this.processCount % 19 === 0) {
+      this.port.postMessage({
+        count: this.count,
+        avg: Math.round(this.avgCount),
+        underruns: this.underruns,
+        drops: this.drops,
+        dupes: this.dupes,
+      });
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-playback', PCMPlaybackProcessor);
+`;
+
+function setStatus(text, state) {
+  statusEl.textContent = text;
+  btn.className = state || '';
+}
+
+function toggleListen() {
+  if (isListening) disconnect();
+  else connect();
+}
+
+async function connect() {
+  if (pc) disconnect();
+  isListening = true;
+  btn.textContent = 'Stop';
+  setStatus('Connecting...', 'connecting');
+  packetsReceived = 0;
+  underruns = 0;
+  lastArrivalMs = 0;
+  jitterDeltas = [];
+
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      latencyHint: 'interactive',
+      sampleRate: 48000,
+    });
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    await connectLowLatency();
+  } catch (e) {
+    console.error('Connection error:', e);
+    setStatus('Error: ' + e.message, 'error');
+  }
+}
+
+function computeJitter() {
+  if (jitterDeltas.length < 2) return null;
+  const sorted = [...jitterDeltas].sort((a, b) => a - b);
+  const n = sorted.length;
+  const mean = sorted.reduce((a, b) => a + b, 0) / n;
+  const variance = sorted.reduce((a, d) => a + (d - mean) ** 2, 0) / n;
+  const stddev = Math.sqrt(variance);
+  return {
+    min: +sorted[0].toFixed(1),
+    max: +sorted[n - 1].toFixed(1),
+    mean: +mean.toFixed(1),
+    stddev: +stddev.toFixed(1),
+    p95: +sorted[Math.floor(n * 0.95)].toFixed(1),
+    n: n,
+  };
+}
+
+async function connectLowLatency() {
+  // Set up AudioWorklet
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm-playback');
+  workletNode.connect(audioCtx.destination);
+
+  workletNode.port.onmessage = (e) => {
+    const { count, avg, underruns: ur, drops, dupes } = e.data;
+    underruns = ur;
+    lastDrops = drops;
+    lastDupes = dupes;
+    const bufferMs = ((count / 48000) * 1000).toFixed(1);
+    const avgMs = ((avg / 48000) * 1000).toFixed(1);
+    lastAvgMs = parseFloat(avgMs);
+    const pct = Math.min(100, (count / 9600) * 100);
+    levelBar.style.width = pct + '%';
+    statsEl.textContent = `Buf: ${bufferMs}ms (avg ${avgMs}ms) | Drift: +${drops}/-${dupes} | Underruns: ${ur} | Pkts: ${packetsReceived}`;
+  };
+
+  pc = new RTCPeerConnection({ iceServers: [] });
+
+  // Create a stats DataChannel (client→server) for reporting metrics
+  const statsDc = pc.createDataChannel('stats');
+  statsDc.onopen = () => {
+    // Report stats to server every 2 seconds
+    statsInterval = setInterval(() => {
+      if (statsDc.readyState === 'open') {
+        const j = computeJitter();
+        statsDc.send(JSON.stringify({
+          underruns, drops: lastDrops, dupes: lastDupes,
+          bufferAvgMs: lastAvgMs, packets: packetsReceived,
+          jitter: j,
+        }));
+      }
+    }, 2000);
+  };
+
+  pc.ondatachannel = (event) => {
+    const dc = event.channel;
+    dc.binaryType = 'arraybuffer';
+    dc.onmessage = (msg) => {
+      packetsReceived++;
+      // Track inter-arrival jitter
+      const now = performance.now();
+      if (lastArrivalMs > 0) {
+        jitterDeltas.push(now - lastArrivalMs);
+        if (jitterDeltas.length > 500) jitterDeltas.shift(); // rolling window
+      }
+      lastArrivalMs = now;
+      // Raw i16 little-endian PCM — convert to f32 and send to worklet
+      const i16 = new Int16Array(msg.data);
+      const f32 = new Float32Array(i16.length);
+      for (let i = 0; i < i16.length; i++) {
+        f32[i] = i16[i] / 32767;
+      }
+      workletNode.port.postMessage(f32, [f32.buffer]);
+    };
+    dc.onopen = () => setStatus('Live (raw PCM via DataChannel)', 'live');
+    dc.onclose = () => { setStatus('DataChannel closed', 'error'); if (isListening) scheduleReconnect(); };
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    if (s === 'connected' || s === 'completed') setStatus('Connected, waiting for data...', 'connecting');
+    else if (s === 'disconnected' || s === 'failed' || s === 'closed') { setStatus('Connection lost', 'error'); if (isListening) scheduleReconnect(); }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  const resp = await fetch('/offer_low_latency', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+  });
+  if (!resp.ok) throw new Error('Server returned ' + resp.status);
+
+  const answer = await resp.json();
+  await pc.setRemoteDescription(new RTCSessionDescription({ sdp: answer.sdp, type: answer.type }));
+}
+
+
+let reconnectTimeout = null;
+function scheduleReconnect() {
+  if (!isListening || reconnectTimeout) return;
+  reconnectTimeout = setTimeout(() => {
+    reconnectTimeout = null;
+    if (isListening) { cleanup(); connect(); }
+  }, 3000);
+}
+
+function disconnect() {
+  isListening = false;
+  btn.textContent = 'Listen';
+  clearTimeout(reconnectTimeout);
+  reconnectTimeout = null;
+  cleanup();
+  levelBar.style.width = '0%';
+  setStatus('Ready', '');
+  statsEl.textContent = '';
+}
+
+function cleanup() {
+  if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+  if (workletNode) { workletNode.disconnect(); workletNode = null; }
+  if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; }
+  if (pc) { pc.close(); pc = null; }
+}
+</script>
+</body>
+</html>
