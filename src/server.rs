@@ -56,6 +56,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/offer", post(offer_handler))
         .route("/ice-candidate", post(ice_candidate_handler))
         .route("/status", get(status_handler))
+        .route("/latency_test", get(latency_test_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -63,6 +64,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// Serve the listener HTML page.
 async fn index_handler() -> impl IntoResponse {
     Html(include_str!("../static/index.html"))
+}
+
+/// Serve the latency test page.
+async fn latency_test_handler() -> impl IntoResponse {
+    Html(include_str!("../static/latency_test.html"))
 }
 
 /// Handle SDP offer from browser, return SDP answer.

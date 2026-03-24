@@ -21,7 +21,7 @@ impl Default for Config {
             log_level: "info".to_string(),
             audio_sample_rate: 48000,
             audio_channels: 1,
-            opus_frame_ms: 10,
+            opus_frame_ms: 5,
         }
     }
 }

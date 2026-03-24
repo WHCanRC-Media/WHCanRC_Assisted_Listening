@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>WHCanRC — Latency Test</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 8px; text-align: center; }
+  .subtitle { font-size: 0.85rem; color: #888; margin-bottom: 32px; text-align: center; max-width: 400px; }
+  .btn {
+    width: 140px; height: 140px; border-radius: 50%;
+    border: 4px solid #4a90d9; background: rgba(74,144,217,0.15);
+    color: #4a90d9; font-size: 1.1rem; font-weight: 600;
+    cursor: pointer; transition: all 0.3s; outline: none;
+    -webkit-tap-highlight-color: transparent;
+    margin: 10px;
+  }
+  .btn:hover { background: rgba(74,144,217,0.3); }
+  .btn:active { transform: scale(0.95); }
+  .btn.live { border-color: #4caf50; background: rgba(76,175,80,0.15); color: #4caf50; }
+  .btn.connecting { border-color: #ff9800; background: rgba(255,152,0,0.15); color: #ff9800; animation: pulse 1.5s infinite; }
+  .btn.measuring { border-color: #9c27b0; background: rgba(156,39,176,0.15); color: #9c27b0; animation: pulse 0.5s infinite; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+  #status { margin-top: 24px; font-size: 0.95rem; color: #888; text-align: center; }
+  .buttons { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+  .results {
+    margin-top: 32px;
+    padding: 16px 24px;
+    background: rgba(255,255,255,0.05);
+    border-radius: 12px;
+    font-family: monospace;
+    font-size: 0.9rem;
+    min-width: 280px;
+    text-align: center;
+  }
+  .results h2 { font-size: 1rem; color: #4a90d9; margin-bottom: 12px; font-family: inherit; }
+  .latency-value { font-size: 2.5rem; font-weight: bold; color: #4caf50; margin: 8px 0; }
+  .latency-value.warn { color: #ff9800; }
+  .latency-value.bad { color: #f44336; }
+  .stats { font-size: 0.8rem; color: #888; margin-top: 8px; }
+  .history { margin-top: 12px; font-size: 0.75rem; color: #666; max-height: 100px; overflow-y: auto; }
+  .instructions {
+    margin-top: 24px;
+    font-size: 0.8rem;
+    color: #666;
+    text-align: center;
+    max-width: 350px;
+  }
+  .nav {
+    margin-top: 32px;
+  }
+  .nav a {
+    font-size: 0.8rem;
+    color: #4a90d9;
+    text-decoration: none;
+  }
+  .nav a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>Latency Test</h1>
+<p class="subtitle">Measures round-trip latency: client chirp → mic → server → RTP → client detection</p>
+
+<div class="buttons">
+  <button id="connect-btn" class="btn" onclick="toggleConnect()">Connect</button>
+  <button id="test-btn" class="btn" disabled>Test</button>
+</div>
+
+<p id="status">Ready</p>
+
+<div class="results" id="results" style="display: none;">
+  <h2>Round-Trip Latency</h2>
+  <div class="latency-value" id="latency-value">—</div>
+  <div class="stats" id="stats"></div>
+  <div class="history" id="history"></div>
+</div>
+
+<p class="instructions">
+  Place phone speaker near the microphone. Click Test to play a chirp and measure how long until it returns through the server.
+</p>
+
+<div class="debug" id="debug" style="margin-top: 16px; font-family: monospace; font-size: 0.7rem; color: #555;"></div>
+
+<div class="nav">
+  <a href="/">← Back to Listen</a>
+</div>
+
+<script>
+let pc = null;
+let audioCtx = null;
+let isConnected = false;
+let isMeasuring = false;
+
+// Chirp detection
+let chirpSentTime = 0;
+let latencyHistory = [];
+let detectorWorklet = null;
+
+// Chirp parameters (must match generation)
+const CHIRP_FREQ_START = 1000;
+const CHIRP_FREQ_END = 4000;
+const CHIRP_DURATION = 0.02; // 20ms
+const SAMPLE_RATE = 48000;
+
+const connectBtn = document.getElementById('connect-btn');
+const testBtn = document.getElementById('test-btn');
+const statusEl = document.getElementById('status');
+
+// Repeat mode state
+let repeatInterval = null;
+let isRepeating = false;
+let holdTimer = null;
+let justStartedRepeat = false; // Prevent immediate stop on release
+const resultsEl = document.getElementById('results');
+const latencyValueEl = document.getElementById('latency-value');
+const statsEl = document.getElementById('stats');
+const historyEl = document.getElementById('history');
+
+// AudioWorklet code for chirp detection (runs on audio thread)
+const detectorWorkletCode = `
+class ChirpDetectorProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.threshold = 0.02;  // Lower threshold for detecting returned chirp
+    this.cooldown = 0;
+    this.cooldownFrames = 48000 * 0.3; // 300ms cooldown
+    this.baseline = 0;
+    this.sampleCount = 0;
+    this.reportInterval = 48000 / 4; // Report every 250ms
+  }
+
+  process(inputs, outputs) {
+    const input = inputs[0][0];
+    if (!input) return true;
+
+    // Calculate RMS energy
+    let energy = 0;
+    for (let i = 0; i < input.length; i++) {
+      energy += input[i] * input[i];
+    }
+    energy = Math.sqrt(energy / input.length);
+
+    // Update baseline (exponential moving average)
+    this.baseline = this.baseline * 0.99 + energy * 0.01;
+
+    // Report levels periodically for debugging
+    this.sampleCount += input.length;
+    if (this.sampleCount >= this.reportInterval) {
+      this.port.postMessage({
+        level: energy.toFixed(4),
+        baseline: this.baseline.toFixed(4),
+        threshold: this.threshold
+      });
+      this.sampleCount = 0;
+    }
+
+    if (this.cooldown > 0) {
+      this.cooldown -= input.length;
+      return true;
+    }
+
+    // Detect if energy is significantly above baseline
+    const spike = energy > this.threshold && energy > this.baseline * 3;
+    if (spike) {
+      this.port.postMessage({ detected: true, energy: energy.toFixed(4) });
+      this.cooldown = this.cooldownFrames;
+    }
+
+    return true;
+  }
+}
+registerProcessor('chirp-detector', ChirpDetectorProcessor);
+`;
+
+function setStatus(text, btnClass) {
+  statusEl.textContent = text;
+  connectBtn.className = 'btn ' + (btnClass || '');
+}
+
+async function toggleConnect() {
+  if (isConnected) {
+    disconnect();
+  } else {
+    await connect();
+  }
+}
+
+async function connect() {
+  setStatus('Connecting...', 'connecting');
+  connectBtn.textContent = 'Stop';
+
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      latencyHint: 'interactive',
+      sampleRate: SAMPLE_RATE,
+    });
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    // Load detector worklet
+    const blob = new Blob([detectorWorkletCode], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    pc = new RTCPeerConnection({ iceServers: [] });
+
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    pc.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) return;
+
+      // Request minimum jitter buffer
+      const receiver = event.receiver;
+      let jitterHint = 'not supported';
+      if ('jitterBufferTarget' in receiver) {
+        receiver.jitterBufferTarget = 0;
+        jitterHint = 'jitterBufferTarget=0';
+      } else if ('playoutDelayHint' in receiver) {
+        receiver.playoutDelayHint = 0;
+        jitterHint = 'playoutDelayHint=0';
+      }
+      console.log('Jitter buffer hint:', jitterHint);
+      document.getElementById('debug').textContent = 'Jitter hint: ' + jitterHint;
+
+      // Connect to detector worklet (NOT to destination - no playback)
+      const source = audioCtx.createMediaStreamSource(stream);
+      detectorWorklet = new AudioWorkletNode(audioCtx, 'chirp-detector');
+      source.connect(detectorWorklet);
+      // Don't connect to destination - prevents feedback
+
+      detectorWorklet.port.onmessage = (e) => {
+        const debugEl = document.getElementById('debug');
+        if (e.data.level !== undefined) {
+          // Debug level report
+          debugEl.textContent = `RX level: ${e.data.level} | baseline: ${e.data.baseline} | threshold: ${e.data.threshold}`;
+        }
+        if (e.data.detected) {
+          console.log('Chirp detected, energy:', e.data.energy);
+          if (isMeasuring) {
+            const now = performance.now();
+            const latency = now - chirpSentTime;
+            onChirpDetected(latency);
+          }
+        }
+      };
+
+      setStatus('Connected', 'live');
+      testBtn.disabled = false;
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      const s = pc.iceConnectionState;
+      if (s === 'connected' || s === 'completed') {
+        isConnected = true;
+      } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+        setStatus('Connection lost', '');
+        isConnected = false;
+        testBtn.disabled = true;
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    const resp = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+    });
+    if (!resp.ok) throw new Error('Server returned ' + resp.status);
+
+    const answer = await resp.json();
+    await pc.setRemoteDescription(new RTCSessionDescription({ sdp: answer.sdp, type: answer.type }));
+
+    isConnected = true;
+
+  } catch (e) {
+    console.error('Connection error:', e);
+    setStatus('Error: ' + e.message, '');
+    disconnect();
+  }
+}
+
+function disconnect() {
+  isConnected = false;
+  isMeasuring = false;
+  stopRepeat();
+  connectBtn.textContent = 'Connect';
+  connectBtn.className = 'btn';
+  testBtn.disabled = true;
+  testBtn.className = 'btn';
+
+  if (detectorWorklet) { detectorWorklet.disconnect(); detectorWorklet = null; }
+  if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; }
+  if (pc) { pc.close(); pc = null; }
+
+  setStatus('Ready', '');
+}
+
+function generateChirp() {
+  const numSamples = Math.floor(SAMPLE_RATE * CHIRP_DURATION);
+  const buffer = audioCtx.createBuffer(1, numSamples, SAMPLE_RATE);
+  const data = buffer.getChannelData(0);
+
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / SAMPLE_RATE;
+    const freq = CHIRP_FREQ_START + (CHIRP_FREQ_END - CHIRP_FREQ_START) * (t / CHIRP_DURATION);
+    // Envelope to avoid clicks
+    const env = Math.sin(Math.PI * i / numSamples);
+    data[i] = Math.sin(2 * Math.PI * freq * t) * env * 0.8;
+  }
+
+  return buffer;
+}
+
+async function runTest() {
+  if (!isConnected || isMeasuring) return;
+
+  isMeasuring = true;
+  testBtn.className = 'btn measuring';
+  testBtn.textContent = 'Listening...';
+
+  // Play chirp
+  const chirpBuffer = generateChirp();
+  const source = audioCtx.createBufferSource();
+  source.buffer = chirpBuffer;
+  source.connect(audioCtx.destination);
+
+  chirpSentTime = performance.now();
+  source.start();
+
+  // Timeout after 2 seconds
+  setTimeout(() => {
+    if (isMeasuring) {
+      isMeasuring = false;
+      testBtn.className = 'btn';
+      testBtn.textContent = 'Test';
+      setStatus('Timeout - no chirp detected. Move speaker closer to mic.', '');
+    }
+  }, 2000);
+}
+
+function onChirpDetected(latencyMs) {
+  isMeasuring = false;
+  testBtn.className = 'btn';
+  testBtn.textContent = 'Test';
+
+  latencyHistory.push(latencyMs);
+  if (latencyHistory.length > 20) latencyHistory.shift();
+
+  // Update display
+  resultsEl.style.display = 'block';
+
+  const latencyClass = latencyMs > 300 ? 'bad' : latencyMs > 150 ? 'warn' : '';
+  latencyValueEl.textContent = Math.round(latencyMs) + ' ms';
+  latencyValueEl.className = 'latency-value ' + latencyClass;
+
+  // Stats
+  if (latencyHistory.length > 1) {
+    const sorted = [...latencyHistory].sort((a, b) => a - b);
+    const min = Math.round(sorted[0]);
+    const max = Math.round(sorted[sorted.length - 1]);
+    const avg = Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length);
+    statsEl.textContent = `min: ${min}ms | avg: ${avg}ms | max: ${max}ms (n=${sorted.length})`;
+  }
+
+  // History
+  const historyItems = latencyHistory.slice(-10).map(l => Math.round(l) + 'ms').join(' → ');
+  historyEl.textContent = historyItems;
+
+  setStatus('Chirp detected!', 'live');
+}
+
+// Repeat mode: hold Test for 2s to start, click to stop
+function startRepeat() {
+  if (isRepeating) return;
+  isRepeating = true;
+  justStartedRepeat = true; // Prevent the release from stopping immediately
+  testBtn.textContent = 'Stop';
+  testBtn.className = 'btn live';
+  setStatus('Repeat mode - tap to stop', 'live');
+
+  // Run first test immediately
+  runTest();
+
+  // Then repeat every 2 seconds
+  repeatInterval = setInterval(() => {
+    if (isConnected && !isMeasuring) {
+      runTest();
+    }
+  }, 2000);
+}
+
+function stopRepeat() {
+  isRepeating = false;
+  if (repeatInterval) {
+    clearInterval(repeatInterval);
+    repeatInterval = null;
+  }
+  if (holdTimer) {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+  }
+  if (isConnected) {
+    testBtn.textContent = 'Test';
+    testBtn.className = 'btn';
+  }
+}
+
+// Test button: click = single test, hold 2s = start repeat, click again = stop
+function onTestDown() {
+  if (!isConnected) return;
+
+  if (isRepeating) {
+    // Already repeating - stop on next click (handled in onTestUp)
+    return;
+  }
+
+  // Start hold timer
+  holdTimer = setTimeout(() => {
+    holdTimer = null;
+    startRepeat();
+  }, 2000);
+}
+
+function onTestUp() {
+  if (!isConnected) return;
+
+  if (isRepeating) {
+    if (justStartedRepeat) {
+      // This is the release after the hold that started repeat - ignore it
+      justStartedRepeat = false;
+      return;
+    }
+    // Stop repeating on next tap
+    stopRepeat();
+    return;
+  }
+
+  // If hold timer is still active, it was a short press - run single test
+  if (holdTimer) {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+    runTest();
+  }
+}
+
+// Set up test button events
+testBtn.addEventListener('mousedown', onTestDown);
+testBtn.addEventListener('mouseup', onTestUp);
+testBtn.addEventListener('touchstart', (e) => { e.preventDefault(); onTestDown(); });
+testBtn.addEventListener('touchend', (e) => { e.preventDefault(); onTestUp(); });
+</script>
+</body>
+</html>
