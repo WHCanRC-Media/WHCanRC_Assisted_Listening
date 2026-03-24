@@ -4,8 +4,6 @@ use tracing::{error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::interceptor::registry::Registry;
@@ -22,7 +20,6 @@ use crate::audio::AudioChunk;
 pub struct PeerManager {
     peers: Arc<Mutex<Vec<Arc<RTCPeerConnection>>>>,
     audio_track: Arc<TrackLocalStaticSample>,
-    data_channels: Arc<Mutex<Vec<Arc<RTCDataChannel>>>>,
     api: webrtc::api::API,
 }
 
@@ -54,7 +51,6 @@ impl PeerManager {
         Ok(Self {
             peers: Arc::new(Mutex::new(Vec::new())),
             audio_track,
-            data_channels: Arc::new(Mutex::new(Vec::new())),
             api,
         })
     }
@@ -143,130 +139,6 @@ impl PeerManager {
         Ok((local_desc, peer_connection))
     }
 
-    /// Get a reference to the shared data channels list for the datachannel writer.
-    pub fn data_channels(&self) -> &Arc<Mutex<Vec<Arc<RTCDataChannel>>>> {
-        &self.data_channels
-    }
-
-    /// Handle an SDP offer for low-latency mode: creates a peer with a DataChannel
-    /// instead of an audio track. Opus packets are sent as binary messages.
-    pub async fn handle_offer_low_latency(
-        &self,
-        offer: RTCSessionDescription,
-    ) -> anyhow::Result<(RTCSessionDescription, Arc<RTCPeerConnection>)> {
-        let config = RTCConfiguration::default();
-        let peer_connection = Arc::new(self.api.new_peer_connection(config).await?);
-
-        // Create a DataChannel for sending Opus packets (unordered, no retransmit)
-        let dc_init = RTCDataChannelInit {
-            ordered: Some(false),
-            max_retransmits: Some(0),
-            ..Default::default()
-        };
-        let data_channel = peer_connection
-            .create_data_channel("opus", Some(dc_init))
-            .await?;
-
-        // Store the data channel once it's open
-        let channels_ref = Arc::clone(&self.data_channels);
-        let dc_clone = Arc::clone(&data_channel);
-        data_channel.on_open(Box::new(move || {
-            let channels_ref = channels_ref.clone();
-            let dc_clone = dc_clone.clone();
-            Box::pin(async move {
-                let mut channels = channels_ref.lock().await;
-                channels.push(dc_clone);
-                info!(
-                    "Low-latency DataChannel opened. Active channels: {}",
-                    channels.len()
-                );
-            })
-        }));
-
-        // Clean up on close
-        let channels_ref = Arc::clone(&self.data_channels);
-        let dc_weak = Arc::downgrade(&data_channel);
-        data_channel.on_close(Box::new(move || {
-            let channels_ref = channels_ref.clone();
-            let dc_weak = dc_weak.clone();
-            Box::pin(async move {
-                if let Some(dc) = dc_weak.upgrade() {
-                    let mut channels = channels_ref.lock().await;
-                    channels.retain(|c| !Arc::ptr_eq(c, &dc));
-                    info!(
-                        "Low-latency DataChannel closed. Active channels: {}",
-                        channels.len()
-                    );
-                }
-            })
-        }));
-
-        // Listen for client-created DataChannels (e.g. "stats")
-        peer_connection.on_data_channel(Box::new(move |dc| {
-            let label = dc.label().to_string();
-            Box::pin(async move {
-                if label == "stats" {
-                    dc.on_message(Box::new(move |msg| {
-                        if let Ok(text) = std::str::from_utf8(&msg.data) {
-                            info!("Client stats: {}", text);
-                            eprintln!("  [client] {}", text);
-                        }
-                        Box::pin(async {})
-                    }));
-                }
-            })
-        }));
-
-        // Track connection state for peer cleanup
-        let peers_ref = Arc::clone(&self.peers);
-        let pc_weak = Arc::downgrade(&peer_connection);
-        peer_connection.on_ice_connection_state_change(Box::new(move |state| {
-            info!("ICE connection state changed (low-latency): {}", state);
-            if state == RTCIceConnectionState::Disconnected
-                || state == RTCIceConnectionState::Failed
-                || state == RTCIceConnectionState::Closed
-            {
-                let peers_ref = peers_ref.clone();
-                let pc_weak = pc_weak.clone();
-                tokio::spawn(async move {
-                    if let Some(pc) = pc_weak.upgrade() {
-                        let mut peers: tokio::sync::MutexGuard<'_, Vec<Arc<RTCPeerConnection>>> =
-                            peers_ref.lock().await;
-                        peers.retain(|p| !Arc::ptr_eq(p, &pc));
-                    }
-                });
-            }
-            Box::pin(async {})
-        }));
-
-        // Set remote description, create answer, gather ICE
-        peer_connection.set_remote_description(offer).await?;
-        let answer = peer_connection.create_answer(None).await?;
-        peer_connection
-            .set_local_description(answer.clone())
-            .await?;
-
-        let mut gather_complete = peer_connection.gathering_complete_promise().await;
-        let _ =
-            tokio::time::timeout(std::time::Duration::from_secs(5), gather_complete.recv()).await;
-
-        let local_desc = peer_connection
-            .local_description()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("Failed to get local description"))?;
-
-        {
-            let mut peers = self.peers.lock().await;
-            peers.push(Arc::clone(&peer_connection));
-            info!(
-                "New low-latency peer connected. Active peers: {}",
-                peers.len()
-            );
-        }
-
-        Ok((local_desc, peer_connection))
-    }
-
     /// Add an ICE candidate to a peer connection.
     pub async fn add_ice_candidate(
         peer: &RTCPeerConnection,
@@ -335,6 +207,15 @@ pub async fn audio_to_track_writer(
     let mut opus_output = vec![0u8; 4000]; // max Opus packet size
     let mut chirp_gen = 0u64;
 
+    // Send timing instrumentation (similar to DataChannel path)
+    let start_time = std::time::Instant::now();
+    let mut last_send = start_time;
+    let mut send_count: u64 = 0;
+    let mut delta_sum_us: u64 = 0;
+    let mut delta_sq_sum: f64 = 0.0;
+    let mut min_delta_us: u64 = u64::MAX;
+    let mut max_delta_us: u64 = 0;
+
     loop {
         match audio_rx.recv().await {
             Ok(chunk) => {
@@ -376,6 +257,36 @@ pub async fn audio_to_track_writer(
 
                             if let Err(e) = track.write_sample(&sample).await {
                                 warn!("Failed to write audio sample to track: {}", e);
+                            } else {
+                                // Track send timing for RTP path
+                                let now = std::time::Instant::now();
+                                let delta_us = now.duration_since(last_send).as_micros() as u64;
+                                last_send = now;
+
+                                if send_count > 0 {
+                                    // Skip first sample (no valid delta)
+                                    delta_sum_us += delta_us;
+                                    delta_sq_sum += (delta_us as f64).powi(2);
+                                    min_delta_us = min_delta_us.min(delta_us);
+                                    max_delta_us = max_delta_us.max(delta_us);
+                                }
+                                send_count += 1;
+
+                                // Log stats every 500 packets (~5 seconds at 10ms frames)
+                                if send_count > 1 && send_count % 500 == 0 {
+                                    let n = send_count - 1; // exclude first sample
+                                    let mean_us = delta_sum_us as f64 / n as f64;
+                                    let variance = (delta_sq_sum / n as f64) - (mean_us * mean_us);
+                                    let stddev_ms = (variance.max(0.0).sqrt()) / 1000.0;
+                                    let mean_ms = mean_us / 1000.0;
+                                    let min_ms = min_delta_us as f64 / 1000.0;
+                                    let max_ms = max_delta_us as f64 / 1000.0;
+
+                                    info!(
+                                        "[RTP] Send interval: mean={:.2}ms stddev={:.3}ms min={:.2}ms max={:.2}ms (n={})",
+                                        mean_ms, stddev_ms, min_ms, max_ms, n
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -389,70 +300,6 @@ pub async fn audio_to_track_writer(
             }
             Err(broadcast::error::RecvError::Closed) => {
                 info!("Audio channel closed, stopping track writer");
-                break;
-            }
-        }
-    }
-}
-
-/// Send raw PCM i16 samples as binary messages on all active DataChannels.
-/// No Opus encoding — zero codec latency, trivial bandwidth on LAN (~96 KB/s).
-/// The client converts i16 → f32 and feeds directly into the AudioWorklet.
-pub async fn audio_to_datachannel_writer(
-    data_channels: Arc<Mutex<Vec<Arc<RTCDataChannel>>>>,
-    mut audio_rx: broadcast::Receiver<AudioChunk>,
-    chirp_state: Option<Arc<crate::latency_test::ChirpState>>,
-) {
-    use bytes::Bytes;
-
-    info!("Audio-to-datachannel writer started (raw PCM i16, no codec)");
-
-    let mut chirp_gen = 0u64;
-
-    loop {
-        match audio_rx.recv().await {
-            Ok(chunk) => {
-                if chunk.samples.is_empty() {
-                    continue;
-                }
-
-                let samples_i16: Vec<i16> = if let Some(ref cs) = chirp_state {
-                    // Latency test mode: silence + chirp only
-                    let mut buf = vec![0i16; chunk.samples.len()];
-                    if cs.should_inject(&mut chirp_gen) {
-                        let start = buf.len().saturating_sub(cs.chirp_waveform.len());
-                        for (i, &s) in cs.chirp_waveform.iter().enumerate() {
-                            buf[start + i] = (s * i16::MAX as f32) as i16;
-                        }
-                    }
-                    buf
-                } else {
-                    // Normal mode: forward mic audio
-                    chunk.samples.iter()
-                        .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-                        .collect()
-                };
-
-                // Convert i16 slice to bytes (little-endian)
-                let byte_len = samples_i16.len() * 2;
-                let mut raw_bytes = Vec::with_capacity(byte_len);
-                for &s in &samples_i16 {
-                    raw_bytes.extend_from_slice(&s.to_le_bytes());
-                }
-                let packet = Bytes::from(raw_bytes);
-
-                let channels = data_channels.lock().await;
-                for dc in channels.iter() {
-                    if let Err(e) = dc.send(&packet).await {
-                        warn!("Failed to send on DataChannel: {}", e);
-                    }
-                }
-            }
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!("Audio receiver lagged (datachannel), dropped {} chunks", n);
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                info!("Audio channel closed, stopping datachannel writer");
                 break;
             }
         }

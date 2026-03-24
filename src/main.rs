@@ -16,7 +16,7 @@ use tracing::info;
 use audio::{start_audio_capture, CpalAudioSource, ToneAudioSource};
 use config::Config;
 use server::{build_router, AppState};
-use webrtc::{audio_to_datachannel_writer, audio_to_track_writer, PeerManager};
+use webrtc::{audio_to_track_writer, PeerManager};
 
 /// WHCanRC Assisted Listening — low-latency WebRTC audio streaming server.
 ///
@@ -96,21 +96,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Start the audio-to-WebRTC-track writer (normal path)
+    // Start the audio-to-WebRTC-track writer
     let audio_rx = audio_tx.subscribe();
     tokio::spawn(audio_to_track_writer(
         audio_track,
         audio_rx,
         config.opus_frame_ms,
-        chirp_state.clone(),
-    ));
-
-    // Start the audio-to-DataChannel writer (low-latency path, raw PCM)
-    let dc_audio_rx = audio_tx.subscribe();
-    let data_channels = Arc::clone(peer_manager.data_channels());
-    tokio::spawn(audio_to_datachannel_writer(
-        data_channels,
-        dc_audio_rx,
         chirp_state,
     ));
 

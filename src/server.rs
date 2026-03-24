@@ -56,9 +56,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/offer", post(offer_handler))
         .route("/ice-candidate", post(ice_candidate_handler))
         .route("/status", get(status_handler))
-        .route("/low_latency", get(low_latency_handler))
-        .route("/offer_low_latency", post(offer_low_latency_handler))
-        .route("/latency_test", get(latency_test_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -66,46 +63,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// Serve the listener HTML page.
 async fn index_handler() -> impl IntoResponse {
     Html(include_str!("../static/index.html"))
-}
-
-/// Serve the low-latency listener page.
-async fn low_latency_handler() -> impl IntoResponse {
-    Html(include_str!("../static/low_latency.html"))
-}
-
-/// Serve the latency test page.
-async fn latency_test_handler() -> impl IntoResponse {
-    Html(include_str!("../static/latency_test.html"))
-}
-
-/// Handle SDP offer for low-latency DataChannel mode.
-async fn offer_low_latency_handler(
-    State(state): State<Arc<AppState>>,
-    Json(offer_req): Json<OfferRequest>,
-) -> Result<Json<AnswerResponse>, (StatusCode, String)> {
-    let offer = RTCSessionDescription::offer(offer_req.sdp).map_err(|e| {
-        error!("Invalid SDP offer: {}", e);
-        (StatusCode::BAD_REQUEST, format!("Invalid SDP offer: {}", e))
-    })?;
-
-    let (answer, peer) = state
-        .peer_manager
-        .handle_offer_low_latency(offer)
-        .await
-        .map_err(|e| {
-            error!("Failed to handle low-latency offer: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create answer: {}", e),
-            )
-        })?;
-
-    *state.last_peer.lock().await = Some(peer);
-
-    Ok(Json(AnswerResponse {
-        sdp: answer.sdp,
-        sdp_type: "answer".to_string(),
-    }))
 }
 
 /// Handle SDP offer from browser, return SDP answer.

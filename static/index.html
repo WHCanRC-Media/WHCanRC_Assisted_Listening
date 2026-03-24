@@ -91,22 +91,6 @@
     color: #666;
     text-align: center;
   }
-  .nav {
-    margin-top: 32px;
-    display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
-    justify-content: center;
-  }
-  .nav a {
-    font-size: 0.8rem;
-    color: #4a90d9;
-    text-decoration: none;
-    padding: 6px 14px;
-    border: 1px solid #333;
-    border-radius: 6px;
-  }
-  .nav a:hover { border-color: #4a90d9; }
 </style>
 </head>
 <body>
@@ -159,6 +143,17 @@ async function connect() {
 
     pc.ontrack = (event) => {
       const stream = event.streams[0] || new MediaStream([event.track]);
+
+      // Request minimum jitter buffer (low latency mode)
+      const receiver = event.receiver;
+      if ('jitterBufferTarget' in receiver) {
+        receiver.jitterBufferTarget = 0;  // Firefox: 0ms target
+        console.log('Set jitterBufferTarget = 0');
+      } else if ('playoutDelayHint' in receiver) {
+        receiver.playoutDelayHint = 0;  // Chrome: 0 seconds
+        console.log('Set playoutDelayHint = 0');
+      }
+
       // Play audio
       const audio = new Audio();
       audio.srcObject = stream;
@@ -267,10 +262,6 @@ function updateLevel() {
 }
 </script>
 
-<div class="nav">
-  <a href="/low_latency">Low Latency</a>
-  <a href="/latency_test">Latency Test</a>
-</div>
 
 </body>
 </html>
