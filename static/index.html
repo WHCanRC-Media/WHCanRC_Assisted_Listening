@@ -219,6 +219,41 @@ let isListening = false;
 let reconnectTimeout = null;
 let transportMode = null; // 'webtransport' or 'webrtc'
 let webtransportPort = null;
+let wakeLock = null;
+
+// Wake Lock — prevent phone from sleeping while listening
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    console.log('Wake lock acquired');
+    wakeLock.addEventListener('release', () => {
+      console.log('Wake lock released');
+      // Re-acquire if still listening (e.g. after tab switch on some browsers)
+      if (isListening) requestWakeLock();
+    });
+  } catch (e) {
+    console.warn('Wake lock failed:', e);
+  }
+}
+
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+
+// Resume audio when page becomes visible again (phone unlock / tab switch)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && isListening) {
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().then(() => console.log('AudioContext resumed'));
+    }
+    // Re-acquire wake lock (released on visibility hidden by some browsers)
+    requestWakeLock();
+  }
+});
 
 const btn = document.getElementById('listen-btn');
 const statusEl = document.getElementById('status');
@@ -258,6 +293,7 @@ async function connect() {
   isListening = true;
   btn.textContent = 'Stop';
   setStatus('Connecting...', 'connecting');
+  requestWakeLock();
 
   const forceWebRTC = document.getElementById('force-webrtc').checked;
 
@@ -554,7 +590,7 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
 
     // Periodic status report (~every 1s at 128-sample blocks)
     this.logCounter++;
-    if (this.logCounter % 375 === 0) {
+    if (this.logCounter % 75 === 0) { // ~5x/sec at 128-sample blocks
       this.port.postMessage({
         type: 'status',
         bufferMs: (this.buffer.length / SAMPLE_RATE * 1000).toFixed(1),
@@ -670,6 +706,7 @@ function disconnect() {
   btn.textContent = 'Listen';
   clearTimeout(reconnectTimeout);
   reconnectTimeout = null;
+  releaseWakeLock();
 
   if (animFrame) {
     cancelAnimationFrame(animFrame);

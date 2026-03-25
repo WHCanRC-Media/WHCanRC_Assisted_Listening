@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use wtransport::endpoint::IncomingSession;
 use wtransport::Identity;
 use wtransport::{Endpoint, ServerConfig};
@@ -159,7 +159,7 @@ async fn stream_audio_datagrams(
                 send_count += 1;
 
                 if send_count.is_multiple_of(500) {
-                    info!(
+                    debug!(
                         "[WebTransport] Sent {} datagrams (seq={}, ts={}, {} bytes each)",
                         send_count, seq, sample_offset, datagram.len()
                     );

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_OPUS};
 use webrtc::api::APIBuilder;
@@ -285,7 +285,7 @@ pub async fn audio_to_track_writer(
                                     let min_ms = min_delta_us as f64 / 1000.0;
                                     let max_ms = max_delta_us as f64 / 1000.0;
 
-                                    info!(
+                                    debug!(
                                         "[RTP] Send interval: mean={:.2}ms stddev={:.3}ms min={:.2}ms max={:.2}ms (n={})",
                                         mean_ms, stddev_ms, min_ms, max_ms, n
                                     );
