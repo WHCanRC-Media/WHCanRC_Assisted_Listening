@@ -273,8 +273,8 @@ mod tests {
         // We should be able to subscribe
         let mut rx = tx.subscribe();
 
-        // Give the thread a moment to produce data
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Give the thread a moment to produce data (CI runners can be slow)
+        std::thread::sleep(std::time::Duration::from_millis(200));
 
         let mut received = 0;
         while let Ok(_chunk) = rx.try_recv() {
