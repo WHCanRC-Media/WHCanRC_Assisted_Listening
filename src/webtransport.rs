@@ -112,7 +112,7 @@ async fn handle_session_inner(
 /// Datagram header format (8 bytes):
 ///   - seq:       u32 LE — packet sequence number (wraps at u32::MAX)
 ///   - timestamp: u32 LE — sample offset since stream start (wraps at u32::MAX)
-/// Followed by raw PCM i16 LE samples.
+///     Followed by raw PCM i16 LE samples.
 const HEADER_SIZE: usize = 8;
 
 /// Stream raw PCM i16 audio as WebTransport datagrams with header.
@@ -161,7 +161,10 @@ async fn stream_audio_datagrams(
                 if send_count.is_multiple_of(500) {
                     debug!(
                         "[WebTransport] Sent {} datagrams (seq={}, ts={}, {} bytes each)",
-                        send_count, seq, sample_offset, datagram.len()
+                        send_count,
+                        seq,
+                        sample_offset,
+                        datagram.len()
                     );
                 }
             }

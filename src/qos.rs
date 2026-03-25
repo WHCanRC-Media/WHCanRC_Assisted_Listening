@@ -61,7 +61,7 @@ fn qwave_mark_voice(raw_socket: usize) -> anyhow::Result<()> {
     use std::mem;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::NetworkManagement::QoS::*;
-    use windows::Win32::Networking::WinSock::{SOCKADDR, SOCKADDR_IN, SOCKET, AF_INET};
+    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN, SOCKET};
 
     let version = QOS_VERSION {
         MajorVersion: 1,
@@ -103,7 +103,10 @@ fn qwave_mark_voice(raw_socket: usize) -> anyhow::Result<()> {
     if !ok.as_bool() {
         let err = std::io::Error::last_os_error();
         // If wildcard dest fails, try without destination (connected socket path)
-        warn!("qWave with wildcard dest failed: {}, trying without dest", err);
+        warn!(
+            "qWave with wildcard dest failed: {}, trying without dest",
+            err
+        );
         let ok = unsafe {
             QOSAddSocketToFlow(
                 qos_handle,

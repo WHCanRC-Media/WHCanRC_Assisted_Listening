@@ -86,67 +86,69 @@ impl AudioSource for CpalAudioSource {
         };
 
         // Try the desired config first; if unsupported, fall back to a device-native config
-        let (actual_config, needs_conversion) =
-            match device.build_input_stream(
-                &desired_config,
-                |_: &[f32], _: &cpal::InputCallbackInfo| {},
-                |_| {},
-                None,
-            ) {
-                Ok(_) => (desired_config.clone(), false),
-                Err(e) => {
+        let (actual_config, needs_conversion) = match device.build_input_stream(
+            &desired_config,
+            |_: &[f32], _: &cpal::InputCallbackInfo| {},
+            |_| {},
+            None,
+        ) {
+            Ok(_) => (desired_config.clone(), false),
+            Err(e) => {
+                warn!(
+                    "Desired audio config ({}Hz, {}ch) not supported: {}",
+                    sample_rate, channels, e
+                );
+
+                // Query device-supported configs and pick the best match
+                let supported = device
+                    .supported_input_configs()
+                    .map_err(|e| anyhow::anyhow!("Cannot query supported configs: {}", e))?;
+
+                let fallback = supported
+                    .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
+                    .min_by_key(|c| {
+                        let sr = c
+                            .min_sample_rate()
+                            .0
+                            .max(c.max_sample_rate().0.min(sample_rate));
+                        let sr_diff = (sr as i64 - sample_rate as i64).unsigned_abs();
+                        let ch_diff = (c.channels() as i64 - channels as i64).unsigned_abs();
+                        (ch_diff, sr_diff)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("No compatible audio input config found"))?;
+
+                let actual_sr = fallback
+                    .min_sample_rate()
+                    .0
+                    .max(fallback.max_sample_rate().0.min(sample_rate));
+                let actual_ch = fallback.channels();
+
+                warn!(
+                    "Falling back to device-native config: {}Hz, {}ch (will convert to {}Hz, {}ch)",
+                    actual_sr, actual_ch, sample_rate, channels
+                );
+
+                if actual_sr != sample_rate {
                     warn!(
-                        "Desired audio config ({}Hz, {}ch) not supported: {}",
-                        sample_rate, channels, e
+                        "Resampling from {}Hz to {}Hz using linear interpolation",
+                        actual_sr, sample_rate
                     );
-
-                    // Query device-supported configs and pick the best match
-                    let supported = device
-                        .supported_input_configs()
-                        .map_err(|e| anyhow::anyhow!("Cannot query supported configs: {}", e))?;
-
-                    let fallback = supported
-                        .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
-                        .min_by_key(|c| {
-                            let sr = c.min_sample_rate().0.max(c.max_sample_rate().0.min(sample_rate));
-                            let sr_diff = (sr as i64 - sample_rate as i64).unsigned_abs();
-                            let ch_diff = (c.channels() as i64 - channels as i64).unsigned_abs();
-                            (ch_diff, sr_diff)
-                        })
-                        .ok_or_else(|| anyhow::anyhow!("No compatible audio input config found"))?;
-
-                    let actual_sr = fallback
-                        .min_sample_rate()
-                        .0
-                        .max(fallback.max_sample_rate().0.min(sample_rate));
-                    let actual_ch = fallback.channels();
-
-                    warn!(
-                        "Falling back to device-native config: {}Hz, {}ch (will convert to {}Hz, {}ch)",
-                        actual_sr, actual_ch, sample_rate, channels
-                    );
-
-                    if actual_sr != sample_rate {
-                        warn!(
-                            "Resampling from {}Hz to {}Hz using linear interpolation",
-                            actual_sr, sample_rate
-                        );
-                    }
-                    if actual_ch != channels {
-                        warn!(
-                            "Downmixing from {} channels to {} channel(s)",
-                            actual_ch, channels
-                        );
-                    }
-
-                    let cfg = cpal::StreamConfig {
-                        channels: actual_ch,
-                        sample_rate: cpal::SampleRate(actual_sr),
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    (cfg, actual_sr != sample_rate || actual_ch != channels)
                 }
-            };
+                if actual_ch != channels {
+                    warn!(
+                        "Downmixing from {} channels to {} channel(s)",
+                        actual_ch, channels
+                    );
+                }
+
+                let cfg = cpal::StreamConfig {
+                    channels: actual_ch,
+                    sample_rate: cpal::SampleRate(actual_sr),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                (cfg, actual_sr != sample_rate || actual_ch != channels)
+            }
+        };
 
         let actual_sr = actual_config.sample_rate.0;
         let actual_ch = actual_config.channels;
