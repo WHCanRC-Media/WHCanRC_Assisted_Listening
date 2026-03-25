@@ -67,7 +67,11 @@ impl AudioSource for CpalAudioSource {
                 })
             })
             .map(|&size| {
-                info!("Using fixed audio buffer size: {} samples ({:.1}ms)", size, size as f32 / sample_rate as f32 * 1000.0);
+                info!(
+                    "Using fixed audio buffer size: {} samples ({:.1}ms)",
+                    size,
+                    size as f32 / sample_rate as f32 * 1000.0
+                );
                 cpal::BufferSize::Fixed(size)
             })
             .unwrap_or_else(|| {

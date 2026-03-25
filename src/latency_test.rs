@@ -19,9 +19,8 @@ pub fn generate_chirp(sample_rate: u32) -> Vec<f32> {
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
             // Instantaneous phase of a linear chirp
-            let phase = 2.0
-                * std::f32::consts::PI
-                * (f0 * t + 0.5 * (f1 - f0) * t * t / duration_s);
+            let phase =
+                2.0 * std::f32::consts::PI * (f0 * t + 0.5 * (f1 - f0) * t * t / duration_s);
             phase.sin() * 0.8
         })
         .collect()
@@ -130,10 +129,7 @@ pub async fn chirp_timer(state: Arc<ChirpState>) {
 }
 
 /// Background task: listens to raw mic audio and detects returning chirps.
-pub async fn chirp_detector(
-    state: Arc<ChirpState>,
-    mut audio_rx: broadcast::Receiver<AudioChunk>,
-) {
+pub async fn chirp_detector(state: Arc<ChirpState>, mut audio_rx: broadcast::Receiver<AudioChunk>) {
     let chirp = &state.chirp_waveform;
     // Normalized correlation threshold (0.0–1.0). 0.5 avoids false positives from noise.
     let threshold = 0.5_f32;
@@ -159,8 +155,7 @@ pub async fn chirp_detector(
                     // Cooldown: ignore detections within 500ms of the last one
                     if last_send > 0 && now.saturating_sub(last_detection_micros) > 500_000 {
                         // Compensate for the sample offset within this chunk
-                        let offset_micros =
-                            (offset as u64 * 1_000_000) / chunk.sample_rate as u64;
+                        let offset_micros = (offset as u64 * 1_000_000) / chunk.sample_rate as u64;
                         let latency_micros =
                             now.saturating_sub(last_send).saturating_sub(offset_micros);
                         let latency_ms = latency_micros as f64 / 1000.0;
@@ -218,9 +213,7 @@ mod tests {
     fn test_detect_chirp_not_present() {
         let chirp = generate_chirp(48000);
         // Random-ish noise
-        let signal: Vec<f32> = (0..500)
-            .map(|i| (i as f32 * 0.1).sin() * 0.1)
-            .collect();
+        let signal: Vec<f32> = (0..500).map(|i| (i as f32 * 0.1).sin() * 0.1).collect();
         let result = detect_chirp(&signal, &chirp, 0.35);
         assert!(result.is_none());
     }

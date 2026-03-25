@@ -178,7 +178,7 @@ pub async fn audio_to_track_writer(
     chirp_state: Option<Arc<crate::latency_test::ChirpState>>,
 ) {
     use audiopus::coder::Encoder;
-    use audiopus::{Application, Channels, SampleRate, Signal, Bitrate};
+    use audiopus::{Application, Bitrate, Channels, SampleRate, Signal};
     use webrtc::media::Sample;
 
     // Calculate frame size in samples: e.g. 10ms at 48kHz = 480 samples
@@ -190,7 +190,8 @@ pub async fn audio_to_track_writer(
         opus_frame_ms, opus_frame_size
     );
 
-    let mut encoder = match Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay) {
+    let mut encoder = match Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay)
+    {
         Ok(enc) => enc,
         Err(e) => {
             error!("Failed to create Opus encoder: {}", e);
@@ -228,7 +229,9 @@ pub async fn audio_to_track_writer(
                     // plus chirp when armed — avoids feedback loop
                     pcm_buffer.extend(std::iter::repeat_n(0i16, chunk.samples.len()));
                     if cs.should_inject(&mut chirp_gen) {
-                        let chirp_i16: Vec<i16> = cs.chirp_waveform.iter()
+                        let chirp_i16: Vec<i16> = cs
+                            .chirp_waveform
+                            .iter()
                             .map(|&s| (s * i16::MAX as f32) as i16)
                             .collect();
                         // Overwrite the tail of the buffer with the chirp

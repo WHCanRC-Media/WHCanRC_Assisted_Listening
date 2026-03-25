@@ -31,23 +31,23 @@ impl WebTransportServer {
     }
 
     /// Start the WebTransport server and stream audio to connected clients.
-    pub async fn run(
-        self,
-        audio_tx: broadcast::Sender<AudioChunk>,
-    ) -> anyhow::Result<()> {
+    pub async fn run(self, audio_tx: broadcast::Sender<AudioChunk>) -> anyhow::Result<()> {
         // Generate self-signed identity for WebTransport
         let identity = Identity::self_signed(["localhost", "127.0.0.1", "0.0.0.0"])
             .map_err(|e| anyhow::anyhow!("Failed to create self-signed identity: {:?}", e))?;
 
         // Get certificate hash for browser
         let cert_chain = identity.certificate_chain();
-        let cert = cert_chain.as_slice().first()
+        let cert = cert_chain
+            .as_slice()
+            .first()
             .ok_or_else(|| anyhow::anyhow!("No certificate in chain"))?;
 
         // Get the SHA-256 hash (wtransport provides this method)
         let hash_digest = cert.hash();
         let hash_bytes: &[u8; 32] = hash_digest.as_ref();
-        let cert_hash = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash_bytes);
+        let cert_hash =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, hash_bytes);
 
         info!("WebTransport certificate hash: {}", cert_hash);
 
@@ -76,10 +76,7 @@ impl WebTransportServer {
 }
 
 /// Handle a single WebTransport session.
-async fn handle_session(
-    incoming: IncomingSession,
-    audio_rx: broadcast::Receiver<AudioChunk>,
-) {
+async fn handle_session(incoming: IncomingSession, audio_rx: broadcast::Receiver<AudioChunk>) {
     let result = handle_session_inner(incoming, audio_rx).await;
     if let Err(e) = result {
         warn!("WebTransport session error: {}", e);
@@ -122,7 +119,9 @@ async fn stream_audio_datagrams(
                 }
 
                 // Convert f32 to i16 and send as raw PCM
-                let pcm_bytes: Vec<u8> = chunk.samples.iter()
+                let pcm_bytes: Vec<u8> = chunk
+                    .samples
+                    .iter()
                     .flat_map(|&s| {
                         let clamped = s.clamp(-1.0, 1.0);
                         let sample = (clamped * i16::MAX as f32) as i16;
@@ -140,7 +139,8 @@ async fn stream_audio_datagrams(
                 if send_count.is_multiple_of(500) {
                     info!(
                         "[WebTransport] Sent {} datagrams ({} bytes each)",
-                        send_count, pcm_bytes.len()
+                        send_count,
+                        pcm_bytes.len()
                     );
                 }
             }
