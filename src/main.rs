@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod latency_test;
+mod qos;
 mod server;
 mod service;
 mod webrtc;

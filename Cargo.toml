@@ -54,10 +54,12 @@ anyhow = "1"
 bytes = "1"
 ringbuf = "0.4"
 base64 = "0.22"
+socket2 = "0.5"
 
 # Windows service support (Windows only)
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+windows = { version = "0.62", features = ["Win32_NetworkManagement_QoS", "Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -181,27 +181,32 @@
 <div id="transport-badge" class="transport-badge" style="display: none;"></div>
 
 <div id="wt-controls" style="display: none; margin-top: 16px; text-align: center; width: 240px;">
-  <div style="font-size: 0.75rem; color: #666; margin-bottom: 4px;">
-    Buffer Target: <span id="buffer-target-label">30</span>ms
-  </div>
-  <input type="range" id="buffer-slider" min="5" max="200" value="30" step="5"
-    style="width: 100%; accent-color: #4a90d9;" oninput="onBufferSliderChange(this.value)">
-  <div style="display: flex; justify-content: space-between; font-size: 0.6rem; color: #555;">
-    <span>5ms</span><span>200ms</span>
-  </div>
+  <details>
+    <summary style="font-size: 0.8rem; color: #888; cursor: pointer; outline: none;">Advanced</summary>
+    <div style="margin-top: 10px;">
+      <div style="font-size: 0.75rem; color: #666; margin-bottom: 4px;">
+        Buffer Target: <span id="buffer-target-label">30</span>ms
+      </div>
+      <input type="range" id="buffer-slider" min="5" max="200" value="30" step="5"
+        style="width: 100%; accent-color: #4a90d9;" oninput="onBufferSliderChange(this.value)">
+      <div style="display: flex; justify-content: space-between; font-size: 0.6rem; color: #555;">
+        <span>5ms</span><span>200ms</span>
+      </div>
 
-  <div style="font-size: 0.75rem; color: #666; margin-top: 10px; margin-bottom: 4px;">Buffer Depth</div>
-  <div style="width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; position: relative;">
-    <div id="buffer-target" style="position: absolute; height: 100%; width: 1px; background: #fff; opacity: 0.5;"></div>
-    <div id="buffer-bar" style="height: 100%; width: 0%; background: #4caf50; border-radius: 4px; transition: width 0.2s ease;"></div>
-  </div>
-  <div id="buffer-label" style="font-size: 0.7rem; color: #888; margin-top: 4px;">0ms</div>
+      <div style="font-size: 0.75rem; color: #666; margin-top: 10px; margin-bottom: 4px;">Buffer Depth</div>
+      <div style="width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; position: relative;">
+        <div id="buffer-target" style="position: absolute; height: 100%; width: 1px; background: #fff; opacity: 0.5;"></div>
+        <div id="buffer-bar" style="height: 100%; width: 0%; background: #4caf50; border-radius: 4px; transition: width 0.2s ease;"></div>
+      </div>
+      <div id="buffer-label" style="font-size: 0.7rem; color: #888; margin-top: 4px;">0ms</div>
 
-  <div id="wt-stats" style="margin-top: 10px; font-size: 0.7rem; color: #888; line-height: 1.6;">
-    <div>Lost packets: <span id="stat-lost" style="color: #ccc;">0</span></div>
-    <div>Buffer underruns: <span id="stat-underruns" style="color: #ccc;">0</span></div>
-    <div>Buffer overflows: <span id="stat-overflows" style="color: #ccc;">0</span></div>
-  </div>
+      <div style="margin-top: 10px; font-size: 0.7rem; color: #888; line-height: 1.6;">
+        <div>Lost packets: <span id="stat-lost" style="color: #ccc;">0</span></div>
+        <div>Buffer underruns: <span id="stat-underruns" style="color: #ccc;">0</span></div>
+        <div>Buffer overflows: <span id="stat-overflows" style="color: #ccc;">0</span></div>
+      </div>
+    </div>
+  </details>
 </div>
 
 <script>
@@ -455,6 +460,7 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buffer = new Float32Array(0);
+    this.filling = true; // initial buffering phase — wait for target before playing
     this.logCounter = 0;
     this.underruns = 0;
     this.overflows = 0;
@@ -500,10 +506,20 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
     const outLen = output.length; // typically 128 samples
 
     const bufLen = this.buffer.length;
+
+    // Initial buffering: wait until buffer reaches target before starting playback
+    if (this.filling) {
+      if (bufLen >= TARGET_BUFFER_SAMPLES) {
+        this.filling = false;
+        this.port.postMessage({ type: 'buffered' });
+      } else {
+        return true; // output silence while filling
+      }
+    }
+
     if (bufLen === 0) {
       // Underrun — output silence
       this.underruns++;
-      // Report every underrun but throttle to avoid flooding
       if (this.underruns % 10 === 1) {
         this.port.postMessage({ type: 'underrun', total: this.underruns });
       }
@@ -512,7 +528,6 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
 
     // Adaptive rate: speed up if buffer too full, slow down if too empty
     const error = bufLen - TARGET_BUFFER_SAMPLES;
-    // Proportional correction: normalize by target, clamp to bounds
     const correction = Math.max(-RATE_ADJUST_MAX, Math.min(RATE_ADJUST_MAX,
         (error / TARGET_BUFFER_SAMPLES) * RATE_ADJUST_MAX));
     const playbackRate = 1.0 + correction;

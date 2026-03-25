@@ -5,6 +5,7 @@
 //!
 //! Sends raw PCM i16 samples (no codec) for simplicity and lowest latency.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{info, warn};
@@ -13,6 +14,7 @@ use wtransport::Identity;
 use wtransport::{Endpoint, ServerConfig};
 
 use crate::audio::AudioChunk;
+use crate::qos;
 
 /// Shared state containing the certificate hash for browser connections.
 pub struct WebTransportState {
@@ -57,8 +59,12 @@ impl WebTransportServer {
             *state = Some(WebTransportState { cert_hash });
         }
 
+        // Create a QoS-marked socket (DSCP EF + qWave on Windows)
+        let bind_addr: SocketAddr = ([0, 0, 0, 0], self.port).into();
+        let qos_socket = qos::create_qos_socket(bind_addr)?;
+
         let config = ServerConfig::builder()
-            .with_bind_default(self.port)
+            .with_bind_socket(qos_socket)
             .with_identity(identity)
             .build();
 
