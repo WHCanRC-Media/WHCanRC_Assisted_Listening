@@ -1,7 +1,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt;
 
 use whcanrc_assisted_listening::server::{build_router, AppState};
@@ -11,6 +11,8 @@ fn test_state() -> Arc<AppState> {
     Arc::new(AppState {
         peer_manager: PeerManager::new().unwrap(),
         last_peer: Mutex::new(None),
+        webtransport_port: 8081,
+        webtransport_state: Arc::new(RwLock::new(None)),
     })
 }
 

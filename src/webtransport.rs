@@ -137,7 +137,7 @@ async fn stream_audio_datagrams(
                 }
 
                 send_count += 1;
-                if send_count % 500 == 0 {
+                if send_count.is_multiple_of(500) {
                     info!(
                         "[WebTransport] Sent {} datagrams ({} bytes each)",
                         send_count, pcm_bytes.len()

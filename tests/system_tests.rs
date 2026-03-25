@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use whcanrc_assisted_listening::audio::{start_audio_capture, ToneAudioSource};
 use whcanrc_assisted_listening::server::{build_router, AppState};
@@ -12,6 +12,8 @@ async fn test_server_starts_and_responds() {
     let state = Arc::new(AppState {
         peer_manager: PeerManager::new().unwrap(),
         last_peer: Mutex::new(None),
+        webtransport_port: 8081,
+        webtransport_state: Arc::new(RwLock::new(None)),
     });
 
     let app = build_router(state);
@@ -54,6 +56,8 @@ async fn test_server_handles_bad_offer_gracefully() {
     let state = Arc::new(AppState {
         peer_manager: PeerManager::new().unwrap(),
         last_peer: Mutex::new(None),
+        webtransport_port: 8081,
+        webtransport_state: Arc::new(RwLock::new(None)),
     });
 
     let app = build_router(state);
@@ -114,6 +118,8 @@ async fn test_end_to_end_audio_delivery() {
     let state = Arc::new(AppState {
         peer_manager,
         last_peer: Mutex::new(None),
+        webtransport_port: 8081,
+        webtransport_state: Arc::new(RwLock::new(None)),
     });
 
     let app = build_router(state);

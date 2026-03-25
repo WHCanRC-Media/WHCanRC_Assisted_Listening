@@ -226,7 +226,7 @@ pub async fn audio_to_track_writer(
                 if let Some(ref cs) = chirp_state {
                     // Latency test mode: send silence (same length as mic data)
                     // plus chirp when armed — avoids feedback loop
-                    pcm_buffer.extend(std::iter::repeat(0i16).take(chunk.samples.len()));
+                    pcm_buffer.extend(std::iter::repeat_n(0i16, chunk.samples.len()));
                     if cs.should_inject(&mut chirp_gen) {
                         let chirp_i16: Vec<i16> = cs.chirp_waveform.iter()
                             .map(|&s| (s * i16::MAX as f32) as i16)
@@ -273,7 +273,7 @@ pub async fn audio_to_track_writer(
                                 send_count += 1;
 
                                 // Log stats every 500 packets (~5 seconds at 10ms frames)
-                                if send_count > 1 && send_count % 500 == 0 {
+                                if send_count > 1 && send_count.is_multiple_of(500) {
                                     let n = send_count - 1; // exclude first sample
                                     let mean_us = delta_sum_us as f64 / n as f64;
                                     let variance = (delta_sq_sum / n as f64) - (mean_us * mean_us);

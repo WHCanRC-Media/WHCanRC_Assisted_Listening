@@ -54,7 +54,7 @@ impl AudioSource for CpalAudioSource {
                     sample_rate: cpal::SampleRate(sample_rate),
                     buffer_size: cpal::BufferSize::Fixed(size),
                 };
-                device.supported_input_configs().map_or(false, |_| {
+                device.supported_input_configs().is_ok_and(|_| {
                     // Try building a dummy stream to check if the buffer size works
                     device
                         .build_input_stream(
