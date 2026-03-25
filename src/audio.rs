@@ -1,5 +1,5 @@
 use tokio::sync::broadcast;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// A chunk of audio samples (mono f32, at the configured sample rate).
 /// Sent via broadcast channel to all WebRTC peer writers.
@@ -85,16 +85,112 @@ impl AudioSource for CpalAudioSource {
             buffer_size,
         };
 
+        // Try the desired config first; if unsupported, fall back to a device-native config
+        let (actual_config, needs_conversion) =
+            match device.build_input_stream(
+                &desired_config,
+                |_: &[f32], _: &cpal::InputCallbackInfo| {},
+                |_| {},
+                None,
+            ) {
+                Ok(_) => (desired_config.clone(), false),
+                Err(e) => {
+                    warn!(
+                        "Desired audio config ({}Hz, {}ch) not supported: {}",
+                        sample_rate, channels, e
+                    );
+
+                    // Query device-supported configs and pick the best match
+                    let supported = device
+                        .supported_input_configs()
+                        .map_err(|e| anyhow::anyhow!("Cannot query supported configs: {}", e))?;
+
+                    let fallback = supported
+                        .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
+                        .min_by_key(|c| {
+                            let sr = c.min_sample_rate().0.max(c.max_sample_rate().0.min(sample_rate));
+                            let sr_diff = (sr as i64 - sample_rate as i64).unsigned_abs();
+                            let ch_diff = (c.channels() as i64 - channels as i64).unsigned_abs();
+                            (ch_diff, sr_diff)
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("No compatible audio input config found"))?;
+
+                    let actual_sr = fallback
+                        .min_sample_rate()
+                        .0
+                        .max(fallback.max_sample_rate().0.min(sample_rate));
+                    let actual_ch = fallback.channels();
+
+                    warn!(
+                        "Falling back to device-native config: {}Hz, {}ch (will convert to {}Hz, {}ch)",
+                        actual_sr, actual_ch, sample_rate, channels
+                    );
+
+                    if actual_sr != sample_rate {
+                        warn!(
+                            "Resampling from {}Hz to {}Hz using linear interpolation",
+                            actual_sr, sample_rate
+                        );
+                    }
+                    if actual_ch != channels {
+                        warn!(
+                            "Downmixing from {} channels to {} channel(s)",
+                            actual_ch, channels
+                        );
+                    }
+
+                    let cfg = cpal::StreamConfig {
+                        channels: actual_ch,
+                        sample_rate: cpal::SampleRate(actual_sr),
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+                    (cfg, actual_sr != sample_rate || actual_ch != channels)
+                }
+            };
+
+        let actual_sr = actual_config.sample_rate.0;
+        let actual_ch = actual_config.channels;
+
         let tx_err = tx.clone();
         let stream = device.build_input_stream(
-            &desired_config,
+            &actual_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let samples = if needs_conversion {
+                    // Downmix to mono if needed
+                    let mono: Vec<f32> = if actual_ch > 1 {
+                        data.chunks(actual_ch as usize)
+                            .map(|frame| frame.iter().sum::<f32>() / actual_ch as f32)
+                            .collect()
+                    } else {
+                        data.to_vec()
+                    };
+
+                    // Resample if needed (simple linear interpolation)
+                    if actual_sr != sample_rate {
+                        let ratio = sample_rate as f64 / actual_sr as f64;
+                        let out_len = (mono.len() as f64 * ratio) as usize;
+                        (0..out_len)
+                            .map(|i| {
+                                let src_pos = i as f64 / ratio;
+                                let idx = src_pos as usize;
+                                let frac = src_pos - idx as f64;
+                                let a = mono[idx.min(mono.len() - 1)];
+                                let b = mono[(idx + 1).min(mono.len() - 1)];
+                                a + (b - a) * frac as f32
+                            })
+                            .collect()
+                    } else {
+                        mono
+                    }
+                } else {
+                    data.to_vec()
+                };
+
                 let chunk = AudioChunk {
-                    samples: data.to_vec(),
+                    samples,
                     sample_rate,
                     channels,
                 };
-                // If no receivers, that's ok — just drop the data
                 let _ = tx.send(chunk);
             },
             move |err| {

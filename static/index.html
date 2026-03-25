@@ -118,6 +118,41 @@
     color: #ffb74d;
     border: 1px solid #ff9800;
   }
+  .toggle-row {
+    margin-top: 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8rem;
+    color: #888;
+  }
+  .toggle-switch {
+    position: relative;
+    width: 40px;
+    height: 22px;
+  }
+  .toggle-switch input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background: #444;
+    border-radius: 22px;
+    transition: 0.3s;
+  }
+  .toggle-slider:before {
+    content: "";
+    position: absolute;
+    height: 16px;
+    width: 16px;
+    left: 3px;
+    bottom: 3px;
+    background: #ccc;
+    border-radius: 50%;
+    transition: 0.3s;
+  }
+  .toggle-switch input:checked + .toggle-slider { background: #ff9800; }
+  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(18px); }
 </style>
 </head>
 <body>
@@ -134,7 +169,25 @@
 </div>
 <p class="level-label">Audio Level</p>
 
+<div class="toggle-row">
+  <span>WebTransport</span>
+  <label class="toggle-switch">
+    <input type="checkbox" id="force-webrtc" onchange="onTransportToggle()">
+    <span class="toggle-slider"></span>
+  </label>
+  <span>WebRTC</span>
+</div>
+
 <div id="transport-badge" class="transport-badge" style="display: none;"></div>
+
+<div id="buffer-info" style="display: none; margin-top: 16px; text-align: center;">
+  <div style="font-size: 0.75rem; color: #666; margin-bottom: 4px;">Buffer Depth</div>
+  <div style="width: 200px; height: 8px; background: #333; border-radius: 4px; overflow: hidden; position: relative;">
+    <div id="buffer-target" style="position: absolute; height: 100%; width: 1px; background: #fff; opacity: 0.5;"></div>
+    <div id="buffer-bar" style="height: 100%; width: 0%; background: #4caf50; border-radius: 4px; transition: width 0.2s ease;"></div>
+  </div>
+  <div id="buffer-label" style="font-size: 0.7rem; color: #888; margin-top: 4px;">0ms</div>
+</div>
 
 <script>
 let pc = null;
@@ -165,6 +218,14 @@ function toggleListen() {
   }
 }
 
+function onTransportToggle() {
+  // If currently listening, reconnect with the new transport
+  if (isListening) {
+    disconnect();
+    connect();
+  }
+}
+
 function setTransportBadge(mode) {
   transportMode = mode;
   transportBadge.style.display = 'block';
@@ -178,6 +239,8 @@ async function connect() {
   btn.textContent = 'Stop';
   setStatus('Connecting...', 'connecting');
 
+  const forceWebRTC = document.getElementById('force-webrtc').checked;
+
   // Get WebTransport port info
   try {
     const info = await fetch('/transport-info').then(r => r.json());
@@ -186,8 +249,8 @@ async function connect() {
     console.warn('Could not get transport info:', e);
   }
 
-  // Try WebTransport first (if supported)
-  if (typeof WebTransport !== 'undefined' && webtransportPort) {
+  // Try WebTransport first (if supported and not forced to WebRTC)
+  if (!forceWebRTC && typeof WebTransport !== 'undefined' && webtransportPort) {
     try {
       await connectWebTransport();
       return;
@@ -253,6 +316,32 @@ async function connectWebTransport() {
     outputChannelCount: [1],
   });
 
+  // Show buffer depth UI for WebTransport
+  const bufferInfo = document.getElementById('buffer-info');
+  const bufferBar = document.getElementById('buffer-bar');
+  const bufferLabel = document.getElementById('buffer-label');
+  const bufferTarget = document.getElementById('buffer-target');
+  bufferInfo.style.display = 'block';
+
+  // Position target marker (max display = 4x target)
+  const maxDisplayMs = WT_TARGET_BUFFER_MS * 4;
+  bufferTarget.style.left = (WT_TARGET_BUFFER_MS / maxDisplayMs * 100) + '%';
+
+  // Log and display adaptive buffer status from worklet
+  workletNode.port.onmessage = (e) => {
+    const msg = e.data;
+    if (msg.type === 'status') {
+      const ms = parseFloat(msg.bufferMs);
+      const pct = Math.min(100, ms / maxDisplayMs * 100);
+      bufferBar.style.width = pct + '%';
+      bufferBar.style.background = ms < WT_TARGET_BUFFER_MS * 0.3 ? '#f44336'
+        : ms > WT_TARGET_BUFFER_MS * 2 ? '#ff9800' : '#4caf50';
+      bufferLabel.textContent = `${msg.bufferMs}ms (rate ${msg.rate})`;
+    } else if (msg.type === 'skip') {
+      console.warn(`[WT buffer] Skipped ${msg.skipped} samples to prevent overflow`);
+    }
+  };
+
   // Create analyser for level meter
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 256;
@@ -261,15 +350,38 @@ async function connectWebTransport() {
 
   updateLevel();
 
-  // Read datagrams and send to worklet
+  // Read datagrams, strip header, and send PCM payload + metadata to worklet
   const reader = wt.datagrams.readable.getReader();
+  let lastSeq = -1;
+  let lostPackets = 0;
   (async () => {
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        // Send raw PCM packet to worklet for playback
-        workletNode.port.postMessage(value, [value.buffer]);
+
+        const dv = new DataView(value.buffer, value.byteOffset, value.byteLength);
+        if (value.byteLength < 8) continue; // malformed
+
+        const seq = dv.getUint32(0, true);
+        const timestamp = dv.getUint32(4, true);
+
+        // Detect packet loss
+        if (lastSeq >= 0) {
+          const expected = (lastSeq + 1) >>> 0; // u32 wrap
+          if (seq !== expected) {
+            const gap = (seq - expected) >>> 0;
+            if (gap < 1000) { // reasonable gap, not a wrap glitch
+              lostPackets += gap;
+              console.warn(`WebTransport: lost ${gap} packet(s) (seq ${expected}..${seq - 1}), total lost: ${lostPackets}`);
+            }
+          }
+        }
+        lastSeq = seq;
+
+        // Extract PCM payload (after 8-byte header)
+        const pcmBytes = value.slice(8);
+        workletNode.port.postMessage({ pcm: pcmBytes, seq, timestamp }, [pcmBytes.buffer]);
       }
     } catch (e) {
       console.error('Datagram read error:', e);
@@ -277,19 +389,34 @@ async function connectWebTransport() {
   })();
 }
 
+// Target buffer level in milliseconds — tune this constant to trade off
+// latency vs. drift resilience. Lower = less latency, higher = smoother.
+const WT_TARGET_BUFFER_MS = 30;
+
 function createPcmWorkletURL() {
-  // AudioWorklet for playing raw PCM i16 samples
+  // AudioWorklet for playing raw PCM i16 samples with adaptive drift correction
   const code = `
+// Target buffer level in samples (passed from main thread)
+const SAMPLE_RATE = 48000;
+let TARGET_BUFFER_SAMPLES = ${Math.round(48000 * WT_TARGET_BUFFER_MS / 1000)};
+const MAX_BUFFER_SAMPLES = TARGET_BUFFER_SAMPLES * 4;
+
+// Playback rate adjustment bounds (subtle — avoids audible pitch shift)
+const RATE_ADJUST_MAX = 0.02;  // +/- 2% max speed correction
+
 class PcmPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buffer = new Float32Array(0);
-    this.port.onmessage = (e) => {
-      // Received raw PCM i16 little-endian bytes
-      const bytes = new Uint8Array(e.data);
-      const samples = new Int16Array(bytes.buffer);
+    this.readPos = 0.0; // fractional read position for resampling
+    this.logCounter = 0;
 
-      // Convert i16 to f32 and append to buffer
+    this.port.onmessage = (e) => {
+      const msg = e.data;
+      const bytes = new Uint8Array(msg.pcm || msg);
+      const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+
+      // Convert i16 to f32
       const floats = new Float32Array(samples.length);
       for (let i = 0; i < samples.length; i++) {
         floats[i] = samples[i] / 32768.0;
@@ -301,10 +428,11 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
       newBuffer.set(floats, this.buffer.length);
       this.buffer = newBuffer;
 
-      // Keep buffer from growing too large (limit to ~200ms)
-      const maxSamples = 48000 * 0.2;
-      if (this.buffer.length > maxSamples) {
-        this.buffer = this.buffer.slice(this.buffer.length - maxSamples);
+      // Hard cap: if buffer grows way too large, skip to target level
+      if (this.buffer.length > MAX_BUFFER_SAMPLES) {
+        const skip = this.buffer.length - TARGET_BUFFER_SAMPLES;
+        this.buffer = this.buffer.slice(skip);
+        this.port.postMessage({ type: 'skip', skipped: skip });
       }
     };
   }
@@ -312,17 +440,51 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
   process(inputs, outputs, parameters) {
     const output = outputs[0][0];
     if (!output) return true;
+    const outLen = output.length; // typically 128 samples
 
-    if (this.buffer.length >= output.length) {
-      // We have enough samples - copy to output
-      output.set(this.buffer.slice(0, output.length));
-      this.buffer = this.buffer.slice(output.length);
-    } else if (this.buffer.length > 0) {
-      // Partial buffer - use what we have, pad with silence
-      output.set(this.buffer);
-      this.buffer = new Float32Array(0);
+    const bufLen = this.buffer.length;
+    if (bufLen === 0) {
+      // Underrun — output silence
+      return true;
     }
-    // else: output silence (buffer already zeroed)
+
+    // Adaptive rate: speed up if buffer too full, slow down if too empty
+    const error = bufLen - TARGET_BUFFER_SAMPLES;
+    // Proportional correction: normalize by target, clamp to bounds
+    const correction = Math.max(-RATE_ADJUST_MAX, Math.min(RATE_ADJUST_MAX,
+        (error / TARGET_BUFFER_SAMPLES) * RATE_ADJUST_MAX));
+    const playbackRate = 1.0 + correction;
+
+    // Read samples at adjusted rate using linear interpolation
+    let readPos = 0.0;
+    for (let i = 0; i < outLen; i++) {
+      const srcIdx = readPos;
+      const idx = Math.floor(srcIdx);
+      const frac = srcIdx - idx;
+
+      if (idx + 1 < bufLen) {
+        output[i] = this.buffer[idx] * (1 - frac) + this.buffer[idx + 1] * frac;
+      } else if (idx < bufLen) {
+        output[i] = this.buffer[idx];
+      }
+      // else: stays 0 (silence)
+
+      readPos += playbackRate;
+    }
+
+    // Consume the samples we read
+    const consumed = Math.min(Math.ceil(readPos), bufLen);
+    this.buffer = this.buffer.slice(consumed);
+
+    // Periodic status log
+    this.logCounter++;
+    if (this.logCounter % 375 === 0) { // ~every 1s at 128-sample blocks
+      this.port.postMessage({
+        type: 'status',
+        bufferMs: (this.buffer.length / SAMPLE_RATE * 1000).toFixed(1),
+        rate: playbackRate.toFixed(4),
+      });
+    }
 
     return true;
   }
@@ -384,6 +546,21 @@ async function connectWebRTC() {
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
+    // Wait for ICE gathering to complete so candidates are in the SDP
+    if (pc.iceGatheringState !== 'complete') {
+      await new Promise((resolve) => {
+        const check = () => {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        };
+        pc.addEventListener('icegatheringstatechange', check);
+        // Safety timeout
+        setTimeout(resolve, 5000);
+      });
+    }
+
     const response = await fetch('/offer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -436,6 +613,8 @@ function disconnect() {
   transportMode = null;
   transportBadge.style.display = 'none';
   levelBar.style.width = '0%';
+  const bufferInfo = document.getElementById('buffer-info');
+  if (bufferInfo) bufferInfo.style.display = 'none';
   setStatus('Ready', '');
 }
 

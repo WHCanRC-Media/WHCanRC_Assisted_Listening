@@ -103,13 +103,20 @@ async fn handle_session_inner(
     stream_audio_datagrams(connection, audio_rx).await
 }
 
-/// Stream raw PCM i16 audio as WebTransport datagrams.
-/// No codec = lowest latency, ~96KB/s for mono 48kHz.
+/// Datagram header format (8 bytes):
+///   - seq:       u32 LE — packet sequence number (wraps at u32::MAX)
+///   - timestamp: u32 LE — sample offset since stream start (wraps at u32::MAX)
+/// Followed by raw PCM i16 LE samples.
+const HEADER_SIZE: usize = 8;
+
+/// Stream raw PCM i16 audio as WebTransport datagrams with header.
 async fn stream_audio_datagrams(
     connection: wtransport::Connection,
     mut audio_rx: broadcast::Receiver<AudioChunk>,
 ) -> anyhow::Result<()> {
     let mut send_count: u64 = 0;
+    let mut seq: u32 = 0;
+    let mut sample_offset: u32 = 0;
 
     loop {
         match audio_rx.recv().await {
@@ -118,29 +125,37 @@ async fn stream_audio_datagrams(
                     continue;
                 }
 
-                // Convert f32 to i16 and send as raw PCM
-                let pcm_bytes: Vec<u8> = chunk
-                    .samples
-                    .iter()
-                    .flat_map(|&s| {
-                        let clamped = s.clamp(-1.0, 1.0);
-                        let sample = (clamped * i16::MAX as f32) as i16;
-                        sample.to_le_bytes()
-                    })
-                    .collect();
+                let num_samples = chunk.samples.len() as u32;
+
+                // Build datagram: [seq(4)] [timestamp(4)] [pcm i16 LE samples...]
+                let pcm_len = chunk.samples.len() * 2;
+                let mut datagram = Vec::with_capacity(HEADER_SIZE + pcm_len);
+
+                // Header
+                datagram.extend_from_slice(&seq.to_le_bytes());
+                datagram.extend_from_slice(&sample_offset.to_le_bytes());
+
+                // PCM payload
+                for &s in &chunk.samples {
+                    let clamped = s.clamp(-1.0, 1.0);
+                    let sample = (clamped * i16::MAX as f32) as i16;
+                    datagram.extend_from_slice(&sample.to_le_bytes());
+                }
 
                 // Send as datagram (unreliable, minimum latency)
-                if let Err(e) = connection.send_datagram(&pcm_bytes) {
+                if let Err(e) = connection.send_datagram(&datagram) {
                     info!("WebTransport connection closed: {}", e);
                     return Ok(());
                 }
 
+                seq = seq.wrapping_add(1);
+                sample_offset = sample_offset.wrapping_add(num_samples);
                 send_count += 1;
+
                 if send_count.is_multiple_of(500) {
                     info!(
-                        "[WebTransport] Sent {} datagrams ({} bytes each)",
-                        send_count,
-                        pcm_bytes.len()
+                        "[WebTransport] Sent {} datagrams (seq={}, ts={}, {} bytes each)",
+                        send_count, seq, sample_offset, datagram.len()
                     );
                 }
             }

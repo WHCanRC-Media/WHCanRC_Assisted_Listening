@@ -329,15 +329,17 @@ async function connectWebTransport() {
     }
   };
 
-  // Read datagrams and send to detector worklet
+  // Read datagrams, strip 8-byte header, and send PCM to detector worklet
   const reader = wt.datagrams.readable.getReader();
   (async () => {
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        // Send raw PCM packet to worklet for detection
-        detectorWorklet.port.postMessage(value, [value.buffer]);
+        if (value.byteLength < 8) continue; // malformed
+        // Strip 8-byte header (seq + timestamp), send PCM payload
+        const pcmBytes = value.slice(8);
+        detectorWorklet.port.postMessage(pcmBytes, [pcmBytes.buffer]);
       }
     } catch (e) {
       console.error('Datagram read error:', e);
