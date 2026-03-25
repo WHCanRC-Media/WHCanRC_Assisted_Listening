@@ -180,13 +180,28 @@
 
 <div id="transport-badge" class="transport-badge" style="display: none;"></div>
 
-<div id="buffer-info" style="display: none; margin-top: 16px; text-align: center;">
-  <div style="font-size: 0.75rem; color: #666; margin-bottom: 4px;">Buffer Depth</div>
-  <div style="width: 200px; height: 8px; background: #333; border-radius: 4px; overflow: hidden; position: relative;">
+<div id="wt-controls" style="display: none; margin-top: 16px; text-align: center; width: 240px;">
+  <div style="font-size: 0.75rem; color: #666; margin-bottom: 4px;">
+    Buffer Target: <span id="buffer-target-label">30</span>ms
+  </div>
+  <input type="range" id="buffer-slider" min="5" max="200" value="30" step="5"
+    style="width: 100%; accent-color: #4a90d9;" oninput="onBufferSliderChange(this.value)">
+  <div style="display: flex; justify-content: space-between; font-size: 0.6rem; color: #555;">
+    <span>5ms</span><span>200ms</span>
+  </div>
+
+  <div style="font-size: 0.75rem; color: #666; margin-top: 10px; margin-bottom: 4px;">Buffer Depth</div>
+  <div style="width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; position: relative;">
     <div id="buffer-target" style="position: absolute; height: 100%; width: 1px; background: #fff; opacity: 0.5;"></div>
     <div id="buffer-bar" style="height: 100%; width: 0%; background: #4caf50; border-radius: 4px; transition: width 0.2s ease;"></div>
   </div>
   <div id="buffer-label" style="font-size: 0.7rem; color: #888; margin-top: 4px;">0ms</div>
+
+  <div id="wt-stats" style="margin-top: 10px; font-size: 0.7rem; color: #888; line-height: 1.6;">
+    <div>Lost packets: <span id="stat-lost" style="color: #ccc;">0</span></div>
+    <div>Buffer underruns: <span id="stat-underruns" style="color: #ccc;">0</span></div>
+    <div>Buffer overflows: <span id="stat-overflows" style="color: #ccc;">0</span></div>
+  </div>
 </div>
 
 <script>
@@ -316,29 +331,45 @@ async function connectWebTransport() {
     outputChannelCount: [1],
   });
 
-  // Show buffer depth UI for WebTransport
-  const bufferInfo = document.getElementById('buffer-info');
+  // Show WebTransport controls & stats
+  activeWorkletNode = workletNode;
+  const wtControls = document.getElementById('wt-controls');
   const bufferBar = document.getElementById('buffer-bar');
   const bufferLabel = document.getElementById('buffer-label');
   const bufferTarget = document.getElementById('buffer-target');
-  bufferInfo.style.display = 'block';
+  const statLost = document.getElementById('stat-lost');
+  const statUnderruns = document.getElementById('stat-underruns');
+  const statOverflows = document.getElementById('stat-overflows');
+  wtControls.style.display = 'block';
 
-  // Position target marker (max display = 4x target)
-  const maxDisplayMs = WT_TARGET_BUFFER_MS * 4;
-  bufferTarget.style.left = (WT_TARGET_BUFFER_MS / maxDisplayMs * 100) + '%';
+  // Sync slider to current value
+  document.getElementById('buffer-slider').value = WT_TARGET_BUFFER_MS;
+  document.getElementById('buffer-target-label').textContent = WT_TARGET_BUFFER_MS;
+  bufferTarget.style.left = '25%'; // target is always at 1/4 of max display
 
-  // Log and display adaptive buffer status from worklet
+  // Handle worklet messages (status, underrun, overflow)
   workletNode.port.onmessage = (e) => {
     const msg = e.data;
     if (msg.type === 'status') {
       const ms = parseFloat(msg.bufferMs);
+      const maxDisplayMs = WT_TARGET_BUFFER_MS * 4;
       const pct = Math.min(100, ms / maxDisplayMs * 100);
       bufferBar.style.width = pct + '%';
       bufferBar.style.background = ms < WT_TARGET_BUFFER_MS * 0.3 ? '#f44336'
         : ms > WT_TARGET_BUFFER_MS * 2 ? '#ff9800' : '#4caf50';
       bufferLabel.textContent = `${msg.bufferMs}ms (rate ${msg.rate})`;
-    } else if (msg.type === 'skip') {
-      console.warn(`[WT buffer] Skipped ${msg.skipped} samples to prevent overflow`);
+      // Update stats from worklet
+      statUnderruns.textContent = msg.underruns;
+      statUnderruns.style.color = msg.underruns > 0 ? '#f44336' : '#ccc';
+      statOverflows.textContent = msg.overflows;
+      statOverflows.style.color = msg.overflows > 0 ? '#ff9800' : '#ccc';
+    } else if (msg.type === 'underrun') {
+      statUnderruns.textContent = msg.total;
+      statUnderruns.style.color = '#f44336';
+    } else if (msg.type === 'overflow') {
+      statOverflows.textContent = msg.total;
+      statOverflows.style.color = '#ff9800';
+      console.warn(`[WT buffer] Overflow: skipped ${msg.skipped} samples (total: ${msg.total})`);
     }
   };
 
@@ -374,6 +405,9 @@ async function connectWebTransport() {
             if (gap < 1000) { // reasonable gap, not a wrap glitch
               lostPackets += gap;
               console.warn(`WebTransport: lost ${gap} packet(s) (seq ${expected}..${seq - 1}), total lost: ${lostPackets}`);
+              const statLost = document.getElementById('stat-lost');
+              statLost.textContent = lostPackets;
+              statLost.style.color = '#f44336';
             }
           }
         }
@@ -389,17 +423,30 @@ async function connectWebTransport() {
   })();
 }
 
-// Target buffer level in milliseconds — tune this constant to trade off
-// latency vs. drift resilience. Lower = less latency, higher = smoother.
-const WT_TARGET_BUFFER_MS = 30;
+// Target buffer level in milliseconds — adjustable via slider.
+// Lower = less latency, higher = smoother.
+let WT_TARGET_BUFFER_MS = 30;
+let activeWorkletNode = null;
+
+function onBufferSliderChange(val) {
+  WT_TARGET_BUFFER_MS = parseInt(val);
+  document.getElementById('buffer-target-label').textContent = val;
+  // Update worklet target in real time
+  if (activeWorkletNode) {
+    activeWorkletNode.port.postMessage({ type: 'setTarget', targetMs: WT_TARGET_BUFFER_MS });
+  }
+  // Update target marker position
+  const maxDisplayMs = WT_TARGET_BUFFER_MS * 4;
+  const bufferTarget = document.getElementById('buffer-target');
+  if (bufferTarget) bufferTarget.style.left = '25%'; // always 1/4 of max display
+}
 
 function createPcmWorkletURL() {
   // AudioWorklet for playing raw PCM i16 samples with adaptive drift correction
   const code = `
-// Target buffer level in samples (passed from main thread)
 const SAMPLE_RATE = 48000;
 let TARGET_BUFFER_SAMPLES = ${Math.round(48000 * WT_TARGET_BUFFER_MS / 1000)};
-const MAX_BUFFER_SAMPLES = TARGET_BUFFER_SAMPLES * 4;
+let MAX_BUFFER_SAMPLES = TARGET_BUFFER_SAMPLES * 4;
 
 // Playback rate adjustment bounds (subtle — avoids audible pitch shift)
 const RATE_ADJUST_MAX = 0.02;  // +/- 2% max speed correction
@@ -408,11 +455,20 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.buffer = new Float32Array(0);
-    this.readPos = 0.0; // fractional read position for resampling
     this.logCounter = 0;
+    this.underruns = 0;
+    this.overflows = 0;
 
     this.port.onmessage = (e) => {
       const msg = e.data;
+
+      // Handle target update from slider
+      if (msg.type === 'setTarget') {
+        TARGET_BUFFER_SAMPLES = Math.round(SAMPLE_RATE * msg.targetMs / 1000);
+        MAX_BUFFER_SAMPLES = TARGET_BUFFER_SAMPLES * 4;
+        return;
+      }
+
       const bytes = new Uint8Array(msg.pcm || msg);
       const samples = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
 
@@ -432,7 +488,8 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
       if (this.buffer.length > MAX_BUFFER_SAMPLES) {
         const skip = this.buffer.length - TARGET_BUFFER_SAMPLES;
         this.buffer = this.buffer.slice(skip);
-        this.port.postMessage({ type: 'skip', skipped: skip });
+        this.overflows++;
+        this.port.postMessage({ type: 'overflow', skipped: skip, total: this.overflows });
       }
     };
   }
@@ -445,6 +502,11 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
     const bufLen = this.buffer.length;
     if (bufLen === 0) {
       // Underrun — output silence
+      this.underruns++;
+      // Report every underrun but throttle to avoid flooding
+      if (this.underruns % 10 === 1) {
+        this.port.postMessage({ type: 'underrun', total: this.underruns });
+      }
       return true;
     }
 
@@ -467,7 +529,6 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
       } else if (idx < bufLen) {
         output[i] = this.buffer[idx];
       }
-      // else: stays 0 (silence)
 
       readPos += playbackRate;
     }
@@ -476,13 +537,15 @@ class PcmPlayerProcessor extends AudioWorkletProcessor {
     const consumed = Math.min(Math.ceil(readPos), bufLen);
     this.buffer = this.buffer.slice(consumed);
 
-    // Periodic status log
+    // Periodic status report (~every 1s at 128-sample blocks)
     this.logCounter++;
-    if (this.logCounter % 375 === 0) { // ~every 1s at 128-sample blocks
+    if (this.logCounter % 375 === 0) {
       this.port.postMessage({
         type: 'status',
         bufferMs: (this.buffer.length / SAMPLE_RATE * 1000).toFixed(1),
         rate: playbackRate.toFixed(4),
+        underruns: this.underruns,
+        overflows: this.overflows,
       });
     }
 
@@ -613,8 +676,9 @@ function disconnect() {
   transportMode = null;
   transportBadge.style.display = 'none';
   levelBar.style.width = '0%';
-  const bufferInfo = document.getElementById('buffer-info');
-  if (bufferInfo) bufferInfo.style.display = 'none';
+  activeWorkletNode = null;
+  const wtControls = document.getElementById('wt-controls');
+  if (wtControls) wtControls.style.display = 'none';
   setStatus('Ready', '');
 }
 
