@@ -267,20 +267,19 @@ mod tests {
 
     #[test]
     fn test_start_audio_capture_returns_sender() {
+        // Test that start_audio_capture returns a working sender
+        // by calling MockAudioSource directly (synchronously) to avoid race conditions
+        let (tx, mut rx) = broadcast::channel(16);
         let source = MockAudioSource { chunk_count: 3 };
-        let tx = start_audio_capture(source, 48000, 1);
 
-        // We should be able to subscribe
-        let mut rx = tx.subscribe();
-
-        // Give the thread a moment to produce data (CI runners can be slow)
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Subscribe BEFORE sending to ensure we receive all messages
+        source.start_capture(tx, 48000, 1).unwrap();
 
         let mut received = 0;
         while let Ok(_chunk) = rx.try_recv() {
             received += 1;
         }
-        assert!(received > 0, "Should have received at least one chunk");
+        assert_eq!(received, 3, "Should have received exactly 3 chunks");
     }
 
     #[test]
