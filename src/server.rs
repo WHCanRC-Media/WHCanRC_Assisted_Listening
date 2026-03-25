@@ -7,7 +7,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::error;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
@@ -15,6 +15,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 use crate::webrtc::PeerManager;
+use crate::webtransport::WebTransportState;
 
 /// Shared application state accessible from all route handlers.
 pub struct AppState {
@@ -23,6 +24,10 @@ pub struct AppState {
     /// In a production system you'd map session IDs to peers, but for LAN
     /// use with sequential connections this is sufficient.
     pub last_peer: Mutex<Option<Arc<RTCPeerConnection>>>,
+    /// Port for WebTransport server (QUIC/HTTP3).
+    pub webtransport_port: u16,
+    /// Shared state containing WebTransport certificate hash.
+    pub webtransport_state: Arc<RwLock<Option<WebTransportState>>>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +62,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/ice-candidate", post(ice_candidate_handler))
         .route("/status", get(status_handler))
         .route("/latency_test", get(latency_test_handler))
+        .route("/transport-info", get(transport_info_handler))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -143,6 +149,25 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusRespon
     })
 }
 
+/// Transport info endpoint - tells the client about WebTransport availability.
+#[derive(Serialize)]
+struct TransportInfoResponse {
+    webtransport_port: u16,
+    /// Base64-encoded SHA-256 hash of the WebTransport certificate.
+    /// Required for browsers to connect to self-signed certs.
+    cert_hash: Option<String>,
+}
+
+async fn transport_info_handler(State(state): State<Arc<AppState>>) -> Json<TransportInfoResponse> {
+    let wt_state = state.webtransport_state.read().await;
+    let cert_hash = wt_state.as_ref().map(|s| s.cert_hash.clone());
+
+    Json(TransportInfoResponse {
+        webtransport_port: state.webtransport_port,
+        cert_hash,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +179,8 @@ mod tests {
         Arc::new(AppState {
             peer_manager: PeerManager::new().unwrap(),
             last_peer: Mutex::new(None),
+            webtransport_port: 8081,
+            webtransport_state: Arc::new(RwLock::new(None)),
         })
     }
 

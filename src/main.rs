@@ -4,6 +4,7 @@ mod latency_test;
 mod server;
 mod service;
 mod webrtc;
+mod webtransport;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,12 +12,13 @@ use std::sync::Arc;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 use audio::{start_audio_capture, CpalAudioSource, ToneAudioSource};
 use config::Config;
 use server::{build_router, AppState};
 use webrtc::{audio_to_track_writer, PeerManager};
+use webtransport::{WebTransportServer, WebTransportState};
 
 /// WHCanRC Assisted Listening — low-latency WebRTC audio streaming server.
 ///
@@ -106,9 +108,17 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // Build application state and HTTP server
+    let webtransport_port = config.port + 1; // WebTransport on port+1 (e.g., 8081)
+
+    // Shared state for WebTransport cert hash
+    let wt_state: Arc<tokio::sync::RwLock<Option<WebTransportState>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+
     let app_state = Arc::new(AppState {
         peer_manager,
         last_peer: Mutex::new(None),
+        webtransport_port,
+        webtransport_state: Arc::clone(&wt_state),
     });
 
     let app = build_router(app_state);
@@ -120,6 +130,15 @@ async fn main() -> anyhow::Result<()> {
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "0.0.0.0".to_string()])?;
     let cert_pem = cert.cert.pem();
     let key_pem = cert.key_pair.serialize_pem();
+
+    // Start WebTransport server on a separate port
+    let wt_server = WebTransportServer::new(webtransport_port, Arc::clone(&wt_state));
+    let wt_audio_tx = audio_tx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = wt_server.run(wt_audio_tx).await {
+            error!("WebTransport server error: {}", e);
+        }
+    });
 
     let tls_config = RustlsConfig::from_pem(cert_pem.into(), key_pem.into()).await?;
 
@@ -134,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
 
     let url = format!("https://{}:{}", lan_ip, config.port);
     info!("Listening on {}", url);
+    info!("WebTransport available on port {}", webtransport_port);
     info!("Note: self-signed cert — accept the browser warning to connect");
 
     // Print QR code to terminal

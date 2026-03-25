@@ -68,6 +68,24 @@
     text-decoration: none;
   }
   .nav a:hover { text-decoration: underline; }
+  .transport-badge {
+    margin-top: 16px;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .transport-badge.webtransport {
+    background: rgba(156, 39, 176, 0.2);
+    color: #ce93d8;
+    border: 1px solid #9c27b0;
+  }
+  .transport-badge.webrtc {
+    background: rgba(255, 152, 0, 0.2);
+    color: #ffb74d;
+    border: 1px solid #ff9800;
+  }
 </style>
 </head>
 <body>
@@ -81,6 +99,8 @@
 </div>
 
 <p id="status">Ready</p>
+
+<div id="transport-badge" class="transport-badge" style="display: none;"></div>
 
 <div class="results" id="results" style="display: none;">
   <h2>Round-Trip Latency</h2>
@@ -101,9 +121,12 @@
 
 <script>
 let pc = null;
+let wt = null; // WebTransport connection
 let audioCtx = null;
 let isConnected = false;
 let isMeasuring = false;
+let transportMode = null; // 'webtransport' or 'webrtc'
+let webtransportPort = null;
 
 // Chirp detection
 let chirpSentTime = 0;
@@ -119,6 +142,7 @@ const SAMPLE_RATE = 48000;
 const connectBtn = document.getElementById('connect-btn');
 const testBtn = document.getElementById('test-btn');
 const statusEl = document.getElementById('status');
+const transportBadge = document.getElementById('transport-badge');
 
 // Repeat mode state
 let repeatInterval = null;
@@ -129,6 +153,13 @@ const resultsEl = document.getElementById('results');
 const latencyValueEl = document.getElementById('latency-value');
 const statsEl = document.getElementById('stats');
 const historyEl = document.getElementById('history');
+
+function setTransportBadge(mode) {
+  transportMode = mode;
+  transportBadge.style.display = 'block';
+  transportBadge.className = 'transport-badge ' + mode;
+  transportBadge.textContent = mode === 'webtransport' ? 'WebTransport' : 'WebRTC (fallback)';
+}
 
 // AudioWorklet code for chirp detection (runs on audio thread)
 const detectorWorkletCode = `
@@ -216,84 +247,257 @@ async function connect() {
     await audioCtx.audioWorklet.addModule(url);
     URL.revokeObjectURL(url);
 
-    pc = new RTCPeerConnection({ iceServers: [] });
+    // Get WebTransport port info
+    try {
+      const info = await fetch('/transport-info').then(r => r.json());
+      webtransportPort = info.webtransport_port;
+    } catch (e) {
+      console.warn('Could not get transport info:', e);
+    }
 
-    pc.addTransceiver('audio', { direction: 'recvonly' });
-
-    pc.ontrack = (event) => {
-      const stream = event.streams[0];
-      if (!stream) return;
-
-      // Request minimum jitter buffer
-      const receiver = event.receiver;
-      let jitterHint = 'not supported';
-      if ('jitterBufferTarget' in receiver) {
-        receiver.jitterBufferTarget = 0;
-        jitterHint = 'jitterBufferTarget=0';
-      } else if ('playoutDelayHint' in receiver) {
-        receiver.playoutDelayHint = 0;
-        jitterHint = 'playoutDelayHint=0';
+    // Try WebTransport first (if supported)
+    if (typeof WebTransport !== 'undefined' && webtransportPort) {
+      try {
+        await connectWebTransport();
+        return;
+      } catch (e) {
+        console.warn('WebTransport failed, falling back to WebRTC:', e);
       }
-      console.log('Jitter buffer hint:', jitterHint);
-      document.getElementById('debug').textContent = 'Jitter hint: ' + jitterHint;
+    }
 
-      // Connect to detector worklet (NOT to destination - no playback)
-      const source = audioCtx.createMediaStreamSource(stream);
-      detectorWorklet = new AudioWorkletNode(audioCtx, 'chirp-detector');
-      source.connect(detectorWorklet);
-      // Don't connect to destination - prevents feedback
-
-      detectorWorklet.port.onmessage = (e) => {
-        const debugEl = document.getElementById('debug');
-        if (e.data.level !== undefined) {
-          // Debug level report
-          debugEl.textContent = `RX level: ${e.data.level} | baseline: ${e.data.baseline} | threshold: ${e.data.threshold}`;
-        }
-        if (e.data.detected) {
-          console.log('Chirp detected, energy:', e.data.energy);
-          if (isMeasuring) {
-            const now = performance.now();
-            const latency = now - chirpSentTime;
-            onChirpDetected(latency);
-          }
-        }
-      };
-
-      setStatus('Connected', 'live');
-      testBtn.disabled = false;
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      const s = pc.iceConnectionState;
-      if (s === 'connected' || s === 'completed') {
-        isConnected = true;
-      } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
-        setStatus('Connection lost', '');
-        isConnected = false;
-        testBtn.disabled = true;
-      }
-    };
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    const resp = await fetch('/offer', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-    });
-    if (!resp.ok) throw new Error('Server returned ' + resp.status);
-
-    const answer = await resp.json();
-    await pc.setRemoteDescription(new RTCSessionDescription({ sdp: answer.sdp, type: answer.type }));
-
-    isConnected = true;
+    // Fall back to WebRTC
+    await connectWebRTC();
 
   } catch (e) {
     console.error('Connection error:', e);
     setStatus('Error: ' + e.message, '');
     disconnect();
   }
+}
+
+async function connectWebTransport() {
+  const host = window.location.hostname;
+  const url = `https://${host}:${webtransportPort}/audio`;
+
+  console.log('Trying WebTransport:', url);
+
+  // Get cert hash from server
+  const info = await fetch('/transport-info').then(r => r.json());
+  if (!info.cert_hash) {
+    throw new Error('WebTransport cert hash not available');
+  }
+
+  // Convert base64 cert hash to ArrayBuffer for WebTransport
+  const hashBytes = Uint8Array.from(atob(info.cert_hash), c => c.charCodeAt(0));
+
+  const options = {
+    serverCertificateHashes: [{
+      algorithm: 'sha-256',
+      value: hashBytes.buffer
+    }]
+  };
+
+  wt = new WebTransport(url, options);
+  await wt.ready;
+  console.log('WebTransport connected');
+
+  setTransportBadge('webtransport');
+
+  // Load PCM player worklet for WebTransport
+  const pcmCode = createPcmDetectorWorkletCode();
+  const pcmBlob = new Blob([pcmCode], { type: 'application/javascript' });
+  const pcmUrl = URL.createObjectURL(pcmBlob);
+  await audioCtx.audioWorklet.addModule(pcmUrl);
+  URL.revokeObjectURL(pcmUrl);
+
+  // Create detector that also receives PCM from WebTransport
+  detectorWorklet = new AudioWorkletNode(audioCtx, 'pcm-chirp-detector');
+  // Don't connect to destination - prevents feedback
+
+  detectorWorklet.port.onmessage = (e) => {
+    const debugEl = document.getElementById('debug');
+    if (e.data.level !== undefined) {
+      debugEl.textContent = `[WT] RX level: ${e.data.level} | baseline: ${e.data.baseline}`;
+    }
+    if (e.data.detected) {
+      console.log('Chirp detected via WebTransport, energy:', e.data.energy);
+      if (isMeasuring) {
+        const now = performance.now();
+        const latency = now - chirpSentTime;
+        onChirpDetected(latency);
+      }
+    }
+  };
+
+  // Read datagrams and send to detector worklet
+  const reader = wt.datagrams.readable.getReader();
+  (async () => {
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        // Send raw PCM packet to worklet for detection
+        detectorWorklet.port.postMessage(value, [value.buffer]);
+      }
+    } catch (e) {
+      console.error('Datagram read error:', e);
+      if (isConnected) {
+        setStatus('Connection lost', '');
+        isConnected = false;
+        testBtn.disabled = true;
+      }
+    }
+  })();
+
+  wt.closed.then(() => {
+    console.log('WebTransport closed');
+    if (isConnected) {
+      setStatus('Connection lost', '');
+      isConnected = false;
+      testBtn.disabled = true;
+    }
+  }).catch(e => {
+    console.error('WebTransport closed with error:', e);
+  });
+
+  setStatus('Connected', 'live');
+  testBtn.disabled = false;
+  isConnected = true;
+}
+
+function createPcmDetectorWorkletCode() {
+  return `
+class PcmChirpDetectorProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.threshold = 0.02;
+    this.cooldown = 0;
+    this.cooldownFrames = 48000 * 0.3;
+    this.baseline = 0;
+    this.sampleCount = 0;
+    this.reportInterval = 48000 / 4;
+
+    this.port.onmessage = (e) => {
+      // Received raw PCM i16 little-endian bytes
+      const bytes = new Uint8Array(e.data);
+      const samples = new Int16Array(bytes.buffer);
+
+      // Calculate energy
+      let energy = 0;
+      for (let i = 0; i < samples.length; i++) {
+        const f = samples[i] / 32768.0;
+        energy += f * f;
+      }
+      energy = Math.sqrt(energy / samples.length);
+
+      // Update baseline
+      this.baseline = this.baseline * 0.99 + energy * 0.01;
+
+      this.sampleCount += samples.length;
+      if (this.sampleCount >= this.reportInterval) {
+        this.port.postMessage({
+          level: energy.toFixed(4),
+          baseline: this.baseline.toFixed(4)
+        });
+        this.sampleCount = 0;
+      }
+
+      if (this.cooldown > 0) {
+        this.cooldown -= samples.length;
+        return;
+      }
+
+      const spike = energy > this.threshold && energy > this.baseline * 3;
+      if (spike) {
+        this.port.postMessage({ detected: true, energy: energy.toFixed(4) });
+        this.cooldown = this.cooldownFrames;
+      }
+    };
+  }
+
+  process(inputs, outputs) {
+    // No processing needed - we handle data via port messages
+    return true;
+  }
+}
+registerProcessor('pcm-chirp-detector', PcmChirpDetectorProcessor);
+`;
+}
+
+async function connectWebRTC() {
+  setTransportBadge('webrtc');
+
+  pc = new RTCPeerConnection({ iceServers: [] });
+
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  pc.ontrack = (event) => {
+    const stream = event.streams[0];
+    if (!stream) return;
+
+    // Request minimum jitter buffer
+    const receiver = event.receiver;
+    let jitterHint = 'not supported';
+    if ('jitterBufferTarget' in receiver) {
+      receiver.jitterBufferTarget = 0;
+      jitterHint = 'jitterBufferTarget=0';
+    } else if ('playoutDelayHint' in receiver) {
+      receiver.playoutDelayHint = 0;
+      jitterHint = 'playoutDelayHint=0';
+    }
+    console.log('Jitter buffer hint:', jitterHint);
+    document.getElementById('debug').textContent = '[WebRTC] Jitter hint: ' + jitterHint;
+
+    // Connect to detector worklet (NOT to destination - no playback)
+    const source = audioCtx.createMediaStreamSource(stream);
+    detectorWorklet = new AudioWorkletNode(audioCtx, 'chirp-detector');
+    source.connect(detectorWorklet);
+    // Don't connect to destination - prevents feedback
+
+    detectorWorklet.port.onmessage = (e) => {
+      const debugEl = document.getElementById('debug');
+      if (e.data.level !== undefined) {
+        debugEl.textContent = `[WebRTC] RX level: ${e.data.level} | baseline: ${e.data.baseline} | threshold: ${e.data.threshold}`;
+      }
+      if (e.data.detected) {
+        console.log('Chirp detected, energy:', e.data.energy);
+        if (isMeasuring) {
+          const now = performance.now();
+          const latency = now - chirpSentTime;
+          onChirpDetected(latency);
+        }
+      }
+    };
+
+    setStatus('Connected', 'live');
+    testBtn.disabled = false;
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    if (s === 'connected' || s === 'completed') {
+      isConnected = true;
+    } else if (s === 'disconnected' || s === 'failed' || s === 'closed') {
+      setStatus('Connection lost', '');
+      isConnected = false;
+      testBtn.disabled = true;
+    }
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  const resp = await fetch('/offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+  });
+  if (!resp.ok) throw new Error('Server returned ' + resp.status);
+
+  const answer = await resp.json();
+  await pc.setRemoteDescription(new RTCSessionDescription({ sdp: answer.sdp, type: answer.type }));
+
+  isConnected = true;
 }
 
 function disconnect() {
@@ -308,7 +512,10 @@ function disconnect() {
   if (detectorWorklet) { detectorWorklet.disconnect(); detectorWorklet = null; }
   if (audioCtx) { audioCtx.close().catch(()=>{}); audioCtx = null; }
   if (pc) { pc.close(); pc = null; }
+  if (wt) { wt.close(); wt = null; }
 
+  transportMode = null;
+  transportBadge.style.display = 'none';
   setStatus('Ready', '');
 }
 

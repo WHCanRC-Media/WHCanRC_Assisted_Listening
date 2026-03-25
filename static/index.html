@@ -100,6 +100,24 @@
     text-decoration: none;
   }
   .nav a:hover { text-decoration: underline; }
+  .transport-badge {
+    margin-top: 16px;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .transport-badge.webtransport {
+    background: rgba(156, 39, 176, 0.2);
+    color: #ce93d8;
+    border: 1px solid #9c27b0;
+  }
+  .transport-badge.webrtc {
+    background: rgba(255, 152, 0, 0.2);
+    color: #ffb74d;
+    border: 1px solid #ff9800;
+  }
 </style>
 </head>
 <body>
@@ -116,17 +134,23 @@
 </div>
 <p class="level-label">Audio Level</p>
 
+<div id="transport-badge" class="transport-badge" style="display: none;"></div>
+
 <script>
 let pc = null;
+let wt = null; // WebTransport connection
 let audioCtx = null;
 let analyser = null;
 let animFrame = null;
 let isListening = false;
 let reconnectTimeout = null;
+let transportMode = null; // 'webtransport' or 'webrtc'
+let webtransportPort = null;
 
 const btn = document.getElementById('listen-btn');
 const statusEl = document.getElementById('status');
 const levelBar = document.getElementById('level-bar');
+const transportBadge = document.getElementById('transport-badge');
 
 function setStatus(text, state) {
   statusEl.textContent = text;
@@ -141,11 +165,176 @@ function toggleListen() {
   }
 }
 
+function setTransportBadge(mode) {
+  transportMode = mode;
+  transportBadge.style.display = 'block';
+  transportBadge.className = 'transport-badge ' + mode;
+  transportBadge.textContent = mode === 'webtransport' ? 'WebTransport' : 'WebRTC (fallback)';
+}
+
 async function connect() {
-  if (pc) disconnect();
+  if (pc || wt) disconnect();
   isListening = true;
   btn.textContent = 'Stop';
   setStatus('Connecting...', 'connecting');
+
+  // Get WebTransport port info
+  try {
+    const info = await fetch('/transport-info').then(r => r.json());
+    webtransportPort = info.webtransport_port;
+  } catch (e) {
+    console.warn('Could not get transport info:', e);
+  }
+
+  // Try WebTransport first (if supported)
+  if (typeof WebTransport !== 'undefined' && webtransportPort) {
+    try {
+      await connectWebTransport();
+      return;
+    } catch (e) {
+      console.warn('WebTransport failed, falling back to WebRTC:', e);
+    }
+  }
+
+  // Fall back to WebRTC
+  await connectWebRTC();
+}
+
+async function connectWebTransport() {
+  const host = window.location.hostname;
+  const url = `https://${host}:${webtransportPort}/audio`;
+
+  console.log('Trying WebTransport:', url);
+
+  // Get cert hash from server
+  const info = await fetch('/transport-info').then(r => r.json());
+  if (!info.cert_hash) {
+    throw new Error('WebTransport cert hash not available');
+  }
+
+  // Convert base64 cert hash to ArrayBuffer for WebTransport
+  const hashBytes = Uint8Array.from(atob(info.cert_hash), c => c.charCodeAt(0));
+
+  const options = {
+    serverCertificateHashes: [{
+      algorithm: 'sha-256',
+      value: hashBytes.buffer
+    }]
+  };
+
+  wt = new WebTransport(url, options);
+
+  wt.closed.then(() => {
+    console.log('WebTransport closed');
+    if (isListening) {
+      setStatus('Disconnected — reconnecting...', 'connecting');
+      scheduleReconnect();
+    }
+  }).catch(e => {
+    console.error('WebTransport closed with error:', e);
+  });
+
+  await wt.ready;
+  console.log('WebTransport connected');
+
+  setTransportBadge('webtransport');
+  setStatus('Live', 'live');
+
+  // Set up audio playback from datagrams
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+    latencyHint: 'interactive',
+    sampleRate: 48000,
+  });
+
+  // Create an AudioWorklet for playing raw PCM datagrams
+  await audioCtx.audioWorklet.addModule(createPcmWorkletURL());
+
+  const workletNode = new AudioWorkletNode(audioCtx, 'pcm-player', {
+    outputChannelCount: [1],
+  });
+
+  // Create analyser for level meter
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+  workletNode.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  updateLevel();
+
+  // Read datagrams and send to worklet
+  const reader = wt.datagrams.readable.getReader();
+  (async () => {
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        // Send raw PCM packet to worklet for playback
+        workletNode.port.postMessage(value, [value.buffer]);
+      }
+    } catch (e) {
+      console.error('Datagram read error:', e);
+    }
+  })();
+}
+
+function createPcmWorkletURL() {
+  // AudioWorklet for playing raw PCM i16 samples
+  const code = `
+class PcmPlayerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new Float32Array(0);
+    this.port.onmessage = (e) => {
+      // Received raw PCM i16 little-endian bytes
+      const bytes = new Uint8Array(e.data);
+      const samples = new Int16Array(bytes.buffer);
+
+      // Convert i16 to f32 and append to buffer
+      const floats = new Float32Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        floats[i] = samples[i] / 32768.0;
+      }
+
+      // Append to playback buffer
+      const newBuffer = new Float32Array(this.buffer.length + floats.length);
+      newBuffer.set(this.buffer);
+      newBuffer.set(floats, this.buffer.length);
+      this.buffer = newBuffer;
+
+      // Keep buffer from growing too large (limit to ~200ms)
+      const maxSamples = 48000 * 0.2;
+      if (this.buffer.length > maxSamples) {
+        this.buffer = this.buffer.slice(this.buffer.length - maxSamples);
+      }
+    };
+  }
+
+  process(inputs, outputs, parameters) {
+    const output = outputs[0][0];
+    if (!output) return true;
+
+    if (this.buffer.length >= output.length) {
+      // We have enough samples - copy to output
+      output.set(this.buffer.slice(0, output.length));
+      this.buffer = this.buffer.slice(output.length);
+    } else if (this.buffer.length > 0) {
+      // Partial buffer - use what we have, pad with silence
+      output.set(this.buffer);
+      this.buffer = new Float32Array(0);
+    }
+    // else: output silence (buffer already zeroed)
+
+    return true;
+  }
+}
+registerProcessor('pcm-player', PcmPlayerProcessor);
+`;
+  const blob = new Blob([code], { type: 'application/javascript' });
+  return URL.createObjectURL(blob);
+}
+
+async function connectWebRTC() {
+  setTransportBadge('webrtc');
 
   try {
     pc = new RTCPeerConnection({ iceServers: [] });
@@ -156,10 +345,10 @@ async function connect() {
       // Request minimum jitter buffer (low latency mode)
       const receiver = event.receiver;
       if ('jitterBufferTarget' in receiver) {
-        receiver.jitterBufferTarget = 0;  // Firefox: 0ms target
+        receiver.jitterBufferTarget = 0;
         console.log('Set jitterBufferTarget = 0');
       } else if ('playoutDelayHint' in receiver) {
-        receiver.playoutDelayHint = 0;  // Chrome: 0 seconds
+        receiver.playoutDelayHint = 0;
         console.log('Set playoutDelayHint = 0');
       }
 
@@ -190,14 +379,11 @@ async function connect() {
       }
     };
 
-    // We only receive audio, but we need to create an offer
-    // Add a transceiver in recvonly mode
     pc.addTransceiver('audio', { direction: 'recvonly' });
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
-    // Send offer to server
     const response = await fetch('/offer', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -218,7 +404,7 @@ async function connect() {
     }));
 
   } catch (e) {
-    console.error('Connection error:', e);
+    console.error('WebRTC connection error:', e);
     setStatus('Error: ' + e.message, 'error');
     scheduleReconnect();
   }
@@ -243,6 +429,12 @@ function disconnect() {
     pc.close();
     pc = null;
   }
+  if (wt) {
+    wt.close();
+    wt = null;
+  }
+  transportMode = null;
+  transportBadge.style.display = 'none';
   levelBar.style.width = '0%';
   setStatus('Ready', '');
 }

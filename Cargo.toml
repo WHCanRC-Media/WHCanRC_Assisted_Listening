@@ -46,10 +46,14 @@ rustls = { version = "0.23", features = ["ring"] }
 # QR code
 qrcode = "0.14"
 
+# WebTransport
+wtransport = "0.7"
+
 # Utilities
 anyhow = "1"
 bytes = "1"
 ringbuf = "0.4"
+base64 = "0.22"
 
 # Windows service support (Windows only)
 [target.'cfg(windows)'.dependencies]
