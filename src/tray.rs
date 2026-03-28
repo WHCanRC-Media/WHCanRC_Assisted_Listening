@@ -1,19 +1,27 @@
-use std::process::Command;
 use tracing::{error, info};
 
-use crate::audio::list_input_devices;
+use crate::audio::{list_input_devices, DeviceSwitcher};
 
 /// Spawn the system tray icon on a dedicated OS thread.
-/// The tray shows available audio input devices and restarts the process on selection.
-pub fn spawn_tray(current_device: Option<String>) {
+/// If a DeviceSwitcher is provided, selecting a device switches live.
+/// Otherwise (e.g. test-tone mode), the device menu is shown but disabled.
+pub fn spawn_tray(
+    current_device: Option<String>,
+    switcher: Option<DeviceSwitcher>,
+    url: String,
+) {
     std::thread::spawn(move || {
-        if let Err(e) = run_tray(current_device) {
+        if let Err(e) = run_tray(current_device, switcher, url) {
             error!("System tray error: {}", e);
         }
     });
 }
 
-fn run_tray(current_device: Option<String>) -> anyhow::Result<()> {
+fn run_tray(
+    mut current_device: Option<String>,
+    switcher: Option<DeviceSwitcher>,
+    url: String,
+) -> anyhow::Result<()> {
     use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::TrayIconBuilder;
 
@@ -23,31 +31,22 @@ fn run_tray(current_device: Option<String>) -> anyhow::Result<()> {
     let devices_submenu = Submenu::new("Audio Input", true);
     let devices = list_input_devices();
 
-    let mut device_items: Vec<(MenuItem, String)> = Vec::new();
-    for (name, is_default) in &devices {
-        let is_active = match &current_device {
-            Some(selected) => selected == name,
-            None => *is_default,
-        };
-        let label = if is_active {
-            format!("* {}", name)
-        } else if *is_default {
-            format!("  {} (default)", name)
-        } else {
-            format!("  {}", name)
-        };
-        let item = MenuItem::new(label, true, None);
-        devices_submenu.append(&item)?;
-        device_items.push((item, name.clone()));
-    }
+    let device_items = build_device_menu(&devices_submenu, &devices, &current_device)?;
 
     menu.append(&devices_submenu)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+
+    let qr_item = MenuItem::new("Show QR Code", true, None);
+    menu.append(&qr_item)?;
+
+    let copy_url_item = MenuItem::new("Copy URL", true, None);
+    menu.append(&copy_url_item)?;
+
     menu.append(&PredefinedMenuItem::separator())?;
 
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&quit_item)?;
 
-    // Create a simple 16x16 icon (blue square)
     let icon = create_icon();
 
     let _tray = TrayIconBuilder::new()
@@ -58,12 +57,9 @@ fn run_tray(current_device: Option<String>) -> anyhow::Result<()> {
 
     info!("System tray icon created");
 
-    // Run the event loop
     let menu_rx = MenuEvent::receiver();
 
     loop {
-        // On Windows we need a message pump; on Linux GTK handles it.
-        // Use a simple polling loop with a short sleep.
         #[cfg(target_os = "windows")]
         {
             use windows::Win32::UI::WindowsAndMessaging::{
@@ -78,18 +74,31 @@ fn run_tray(current_device: Option<String>) -> anyhow::Result<()> {
             }
         }
 
-        // Check for menu events
         if let Ok(event) = menu_rx.try_recv() {
-            // Check if quit was clicked
             if event.id() == quit_item.id() {
                 info!("Quit requested from tray");
                 std::process::exit(0);
             }
 
-            // Check if a device was selected
+            if event.id() == qr_item.id() {
+                show_qr_code(&url);
+            }
+
+            if event.id() == copy_url_item.id() {
+                copy_to_clipboard(&url);
+            }
+
             for (item, device_name) in &device_items {
                 if event.id() == item.id() {
-                    restart_with_device(device_name);
+                    if let Some(ref switcher) = switcher {
+                        info!("Switching to device: {}", device_name);
+                        switcher.switch_device(device_name.clone());
+                        current_device = Some(device_name.clone());
+
+                        // Update menu labels to reflect new selection
+                        let devices = list_input_devices();
+                        update_device_labels(&device_items, &devices, &current_device);
+                    }
                 }
             }
         }
@@ -98,44 +107,139 @@ fn run_tray(current_device: Option<String>) -> anyhow::Result<()> {
     }
 }
 
-fn restart_with_device(device_name: &str) {
-    info!("Restarting with device: {}", device_name);
-
-    let exe = std::env::current_exe().expect("Failed to get current exe path");
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Remove existing --device and its value
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--device" {
-            args.remove(i);
-            if i < args.len() {
-                args.remove(i);
-            }
-        } else if args[i].starts_with("--device=") {
-            args.remove(i);
-        } else {
-            i += 1;
-        }
+fn build_device_menu(
+    submenu: &muda::Submenu,
+    devices: &[(String, bool)],
+    current_device: &Option<String>,
+) -> anyhow::Result<Vec<(muda::MenuItem, String)>> {
+    let mut items = Vec::new();
+    for (name, is_default) in devices {
+        let is_active = match current_device {
+            Some(ref selected) => selected == name,
+            None => *is_default,
+        };
+        let label = format_device_label(name, is_active, *is_default);
+        let item = muda::MenuItem::new(label, true, None);
+        submenu.append(&item)?;
+        items.push((item, name.clone()));
     }
+    Ok(items)
+}
 
-    // Add new device selection
-    args.push("--device".to_string());
-    args.push(device_name.to_string());
-
-    match Command::new(&exe).args(&args).spawn() {
-        Ok(_) => {
-            info!("New instance started, exiting current process");
-            std::process::exit(0);
-        }
-        Err(e) => {
-            error!("Failed to restart: {}", e);
-        }
+fn update_device_labels(
+    items: &[(muda::MenuItem, String)],
+    devices: &[(String, bool)],
+    current_device: &Option<String>,
+) {
+    for (item, name) in items {
+        let is_default = devices.iter().any(|(n, d)| n == name && *d);
+        let is_active = match current_device {
+            Some(ref selected) => selected == name,
+            None => is_default,
+        };
+        item.set_text(format_device_label(name, is_active, is_default));
     }
 }
 
+fn format_device_label(name: &str, is_active: bool, is_default: bool) -> String {
+    if is_active {
+        format!("* {}", name)
+    } else if is_default {
+        format!("  {} (default)", name)
+    } else {
+        format!("  {}", name)
+    }
+}
+
+fn show_qr_code(url: &str) {
+    use qrcode::QrCode;
+
+    let qr = match QrCode::new(url.as_bytes()) {
+        Ok(qr) => qr,
+        Err(e) => {
+            error!("Failed to generate QR code: {}", e);
+            return;
+        }
+    };
+
+    let svg = qr
+        .render::<qrcode::render::svg::Color>()
+        .quiet_zone(true)
+        .min_dimensions(200, 200)
+        .build();
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Connect — WHCanRC</title>
+<style>
+  body {{ display:flex; flex-direction:column; align-items:center; justify-content:center;
+         height:100vh; margin:0; font-family:system-ui,sans-serif; background:#f5f5f5; }}
+  a {{ font-size:1.2em; margin-top:1em; color:#2563eb; }}
+</style></head>
+<body>{svg}<a href="{url}">{url}</a></body></html>"#,
+        svg = svg,
+        url = url
+    );
+
+    let path = std::env::temp_dir().join("whcanrc_qr.html");
+    if let Err(e) = std::fs::write(&path, html) {
+        error!("Failed to write QR code file: {}", e);
+        return;
+    }
+
+    info!("Opening QR code in browser");
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&path).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", &format!("echo|set /p={}|clip", text)])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+        }
+    }
+    info!("URL copied to clipboard");
+}
+
 fn create_icon() -> tray_icon::Icon {
-    // 16x16 RGBA icon — a simple filled blue/green circle
     let size = 16u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let center = size as f32 / 2.0;
@@ -148,10 +252,10 @@ fn create_icon() -> tray_icon::Icon {
             let dist = (dx * dx + dy * dy).sqrt();
             let idx = ((y * size + x) * 4) as usize;
             if dist <= radius {
-                rgba[idx] = 74;      // R
-                rgba[idx + 1] = 144;  // G
-                rgba[idx + 2] = 217;  // B
-                rgba[idx + 3] = 255;  // A
+                rgba[idx] = 74;
+                rgba[idx + 1] = 144;
+                rgba[idx + 2] = 217;
+                rgba[idx + 3] = 255;
             }
         }
     }

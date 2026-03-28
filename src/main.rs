@@ -15,7 +15,7 @@ use clap::Parser;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-use audio::{start_audio_capture, CpalAudioSource, ToneAudioSource};
+use audio::{start_audio_capture, start_audio_capture_with_switching, ToneAudioSource};
 use config::Config;
 use server::{build_router, AppState};
 use webrtc::{audio_to_track_writer, PeerManager};
@@ -68,26 +68,37 @@ async fn main() -> anyhow::Result<()> {
     let peer_manager = PeerManager::new()?;
     let audio_track = Arc::clone(peer_manager.audio_track());
 
+    // Detect LAN IP for the QR code / URL
+    let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("8.8.8.8:80")?;
+            s.local_addr()
+        })
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "localhost".to_string());
+    let url = format!("https://{}:{}", lan_ip, config.port);
+
     // Start audio capture (real mic or test tone)
     let audio_tx = if cli.test_tone {
         info!("Using test tone (440Hz sine wave) instead of audio input");
-        start_audio_capture(
+        let tx = start_audio_capture(
             ToneAudioSource,
             config.audio_sample_rate,
             config.audio_channels,
-        )
+        );
+        // Launch tray without device switching
+        tray::spawn_tray(cli.device.clone(), None, url.clone());
+        tx
     } else {
-        start_audio_capture(
-            CpalAudioSource {
-                device_name: cli.device.clone(),
-            },
+        let (tx, switcher) = start_audio_capture_with_switching(
+            cli.device.clone(),
             config.audio_sample_rate,
             config.audio_channels,
-        )
+        );
+        // Launch tray with device switching
+        tray::spawn_tray(cli.device.clone(), Some(switcher), url.clone());
+        tx
     };
-
-    // Launch system tray icon (background thread with device selection menu)
-    tray::spawn_tray(cli.device.clone());
 
     // Set up latency test if requested
     let chirp_state = if cli.latency_test {
@@ -152,16 +163,6 @@ async fn main() -> anyhow::Result<()> {
 
     let tls_config = RustlsConfig::from_pem(cert_pem.into(), key_pem.into()).await?;
 
-    // Detect LAN IP for the QR code
-    let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "localhost".to_string());
-
-    let url = format!("https://{}:{}", lan_ip, config.port);
     info!("Listening on {}", url);
     info!("WebTransport available on port {}", webtransport_port);
     info!("Note: self-signed cert — accept the browser warning to connect");
@@ -171,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         let rendered = qr
             .render::<char>()
             .quiet_zone(true)
-            .module_dimensions(2, 1)
+            .module_dimensions(1, 1)
             .build();
         eprintln!("\n{}\n  {}\n", rendered, url);
     }

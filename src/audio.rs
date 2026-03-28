@@ -1,3 +1,4 @@
+use std::sync::mpsc;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -47,6 +48,7 @@ pub fn list_input_devices() -> Vec<(String, bool)> {
 /// Real audio source using cpal. Optionally targets a specific device by name.
 pub struct CpalAudioSource {
     pub device_name: Option<String>,
+    pub stop_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl AudioSource for CpalAudioSource {
@@ -237,9 +239,15 @@ impl AudioSource for CpalAudioSource {
         stream.play()?;
         info!("Audio capture started ({}Hz, {} ch)", sample_rate, channels);
 
-        // Block forever — the stream runs until this thread is stopped
-        std::thread::park();
+        // Block until stop is signalled. The stream lives as long as we block here.
+        // When this returns, the stream is dropped and capture stops.
+        if let Some(ref stop_rx) = self.stop_rx {
+            let _ = stop_rx.recv(); // blocks until stop signal or sender dropped
+        } else {
+            std::thread::park(); // legacy: block forever
+        }
 
+        info!("Audio capture stopped");
         Ok(())
     }
 }
@@ -321,13 +329,77 @@ impl AudioSource for MockAudioSource {
     }
 }
 
-/// Start audio capture on a background thread, returning a broadcast sender.
+/// Handle for switching audio devices at runtime.
+pub struct DeviceSwitcher {
+    switch_tx: mpsc::Sender<String>,
+}
+
+impl DeviceSwitcher {
+    /// Switch to a new audio input device by name. The current stream stops
+    /// and a new one starts — there will be a brief silence gap.
+    pub fn switch_device(&self, device_name: String) {
+        let _ = self.switch_tx.send(device_name);
+    }
+}
+
+/// Start audio capture on a background thread with live device switching.
+/// Returns a broadcast sender for audio chunks and a DeviceSwitcher handle.
+pub fn start_audio_capture_with_switching(
+    initial_device: Option<String>,
+    sample_rate: u32,
+    channels: u16,
+) -> (broadcast::Sender<AudioChunk>, DeviceSwitcher) {
+    let (tx, _rx) = broadcast::channel(100);
+    let tx_clone = tx.clone();
+    let (switch_tx, switch_rx) = mpsc::channel::<String>();
+
+    std::thread::spawn(move || {
+        let mut current_device = initial_device;
+
+        loop {
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
+
+            let source = CpalAudioSource {
+                device_name: current_device.clone(),
+                stop_rx: Some(stop_rx),
+            };
+
+            // Run capture in a sub-thread so we can stop it
+            let capture_tx = tx_clone.clone();
+            let capture_handle = std::thread::spawn(move || {
+                if let Err(e) = source.start_capture(capture_tx, sample_rate, channels) {
+                    error!("Audio capture failed: {}", e);
+                }
+            });
+
+            // Wait for a device switch request
+            match switch_rx.recv() {
+                Ok(new_device) => {
+                    info!("Switching audio device to: {}", new_device);
+                    // Signal the capture to stop (drop the stream)
+                    let _ = stop_tx.send(());
+                    let _ = capture_handle.join();
+                    current_device = Some(new_device);
+                    // Loop continues — starts capture with new device
+                }
+                Err(_) => {
+                    // Channel closed, no more switches possible — let capture run
+                    let _ = capture_handle.join();
+                    break;
+                }
+            }
+        }
+    });
+
+    (tx, DeviceSwitcher { switch_tx })
+}
+
+/// Start audio capture on a background thread (no device switching).
 pub fn start_audio_capture<S: AudioSource>(
     source: S,
     sample_rate: u32,
     channels: u16,
 ) -> broadcast::Sender<AudioChunk> {
-    // Buffer up to 100 chunks (~2 seconds at 20ms/chunk)
     let (tx, _rx) = broadcast::channel(100);
     let tx_clone = tx.clone();
 
