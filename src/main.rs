@@ -3,7 +3,7 @@ mod config;
 mod latency_test;
 mod qos;
 mod server;
-mod service;
+mod tray;
 mod webrtc;
 mod webtransport;
 
@@ -36,6 +36,10 @@ struct Cli {
     /// and listens for it to return through the mic
     #[arg(long)]
     latency_test: bool,
+
+    /// Audio input device name (default: system default device)
+    #[arg(long)]
+    device: Option<String>,
 }
 
 #[tokio::main]
@@ -74,11 +78,16 @@ async fn main() -> anyhow::Result<()> {
         )
     } else {
         start_audio_capture(
-            CpalAudioSource,
+            CpalAudioSource {
+                device_name: cli.device.clone(),
+            },
             config.audio_sample_rate,
             config.audio_channels,
         )
     };
+
+    // Launch system tray icon (background thread with device selection menu)
+    tray::spawn_tray(cli.device.clone());
 
     // Set up latency test if requested
     let chirp_state = if cli.latency_test {

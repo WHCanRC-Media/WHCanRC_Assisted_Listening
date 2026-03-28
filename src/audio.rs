@@ -23,8 +23,31 @@ pub trait AudioSource: Send + 'static {
     ) -> anyhow::Result<()>;
 }
 
-/// Real audio source using cpal.
-pub struct CpalAudioSource;
+/// List available audio input devices. Returns (name, is_default) pairs.
+pub fn list_input_devices() -> Vec<(String, bool)> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.name().ok())
+        .unwrap_or_default();
+    host.input_devices()
+        .map(|devices| {
+            devices
+                .filter_map(|d| {
+                    let name = d.name().ok()?;
+                    let is_default = name == default_name;
+                    Some((name, is_default))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Real audio source using cpal. Optionally targets a specific device by name.
+pub struct CpalAudioSource {
+    pub device_name: Option<String>,
+}
 
 impl AudioSource for CpalAudioSource {
     fn start_capture(
@@ -36,9 +59,14 @@ impl AudioSource for CpalAudioSource {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("No default input device found"))?;
+        let device = if let Some(ref name) = self.device_name {
+            host.input_devices()?
+                .find(|d| d.name().ok().as_deref() == Some(name))
+                .ok_or_else(|| anyhow::anyhow!("Audio device '{}' not found", name))?
+        } else {
+            host.default_input_device()
+                .ok_or_else(|| anyhow::anyhow!("No default input device found"))?
+        };
 
         info!(
             "Using input device: {}",
@@ -293,7 +321,7 @@ impl AudioSource for MockAudioSource {
     }
 }
 
-/// Start audio capture on a background thread, returning a broadcast receiver.
+/// Start audio capture on a background thread, returning a broadcast sender.
 pub fn start_audio_capture<S: AudioSource>(
     source: S,
     sample_rate: u32,
